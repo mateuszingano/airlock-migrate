@@ -1,4 +1,4 @@
-name: 'Migration Guard'
+name: 'Airlock Migration Guard'
 description: 'Fail the build when a Supabase/Postgres migration ships a table without RLS, disables RLS, or drops a policy/trigger.'
 branding:
   icon: 'shield'
