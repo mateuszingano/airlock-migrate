@@ -1,0 +1,33 @@
+name: action-selftest
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  # The Action must GATE: run it (uses: ./) against the leaky migrations and
+  # assert it fails the build.
+  action-gates-a-leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          dir: test/fixtures
+      - name: the gate must FAIL on the leaky migrations
+        run: |
+          if [ "${{ steps.gate.outcome }}" = "failure" ]; then
+            echo "✓ gate correctly failed on the leaky migrations"
+          else
+            echo "::error::expected the gate to fail on test/fixtures but it passed"
+            exit 1
+          fi
+
+  # The Action must PASS on a clean-only folder (no false alarm).
+  action-passes-when-clean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p _clean && cp test/fixtures/clean.sql _clean/
+      - uses: ./
+        with:
+          dir: _clean

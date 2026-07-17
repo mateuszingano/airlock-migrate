@@ -1,0 +1,21 @@
+name: 'Migration Guard'
+description: 'Fail the build when a Supabase/Postgres migration ships a table without RLS, disables RLS, or drops a policy/trigger.'
+branding:
+  icon: 'shield'
+  color: 'green'
+inputs:
+  dir:
+    description: 'Folder of .sql migrations to lint.'
+    required: false
+    default: 'supabase/migrations'
+  allow:
+    description: 'Comma-separated tokens to silence (rule:drop_trigger or a table/policy name).'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        MIGRATION_GUARD_ALLOW: ${{ inputs.allow }}
+      run: npx --yes airlock-migrate "${{ inputs.dir }}"

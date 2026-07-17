@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Unit tests — pure static lint, no database required.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test
+
+  # Smoke-test the CLI end-to-end: it MUST fail (exit 1) on the leaky fixture and
+  # pass (exit 0) on a clean-only folder. Guards the exit-code contract the CI
+  # gate depends on.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: leaky fixtures must FAIL (exit 1)
+        run: |
+          if node bin/migration-guard.mjs test/fixtures; then
+            echo "::error::expected a non-zero exit on the leaky fixtures"
+            exit 1
+          fi
+      - name: a clean-only folder must PASS (exit 0)
+        run: |
+          mkdir -p clean-fixtures
+          cp test/fixtures/clean.sql clean-fixtures/
+          node bin/migration-guard.mjs clean-fixtures

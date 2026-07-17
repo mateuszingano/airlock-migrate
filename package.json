@@ -1,0 +1,46 @@
+{
+  "name": "airlock-migrate",
+  "version": "0.1.0",
+  "description": "The CI gate for dangerous Supabase/Postgres migrations. Fails your build when a migration ships a table without RLS, disables RLS, adds a USING (true) policy, or drops a policy/trigger. No database connection required.",
+  "type": "module",
+  "bin": {
+    "migration-guard": "bin/migration-guard.mjs",
+    "airlock-migrate": "bin/migration-guard.mjs"
+  },
+  "exports": {
+    ".": "./src/lint.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/migration-guard.mjs",
+    "test": "node --test",
+    "prepublishOnly": "node --test"
+  },
+  "keywords": [
+    "supabase",
+    "postgres",
+    "migration",
+    "rls",
+    "row-level-security",
+    "security",
+    "ci",
+    "ci-gate",
+    "linter",
+    "github-action"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "Mateus Zingano",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mateuszingano/airlock-migrate.git"
+  },
+  "homepage": "https://shipsealed.com",
+  "license": "MIT"
+}
