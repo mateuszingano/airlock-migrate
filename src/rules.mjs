@@ -188,17 +188,23 @@ export function scanSql(sql, file) {
     events.push({ type: 'create', key: t.key, display: t.display, ifne: !!m[2], file, line: lineAt(m.index), index: m.index })
   }
 
-  // SELECT ... INTO <table> FROM ... — creates a NEW table (like CREATE TABLE AS)
-  // that ships with RLS OFF, same failure mode as CREATE TABLE. `INTO … FROM` is
-  // distinctive of SELECT-INTO (INSERT INTO never has `INTO name FROM`). Skip:
+  // SELECT ... INTO <table> — creates a NEW table (like CREATE TABLE AS) that
+  // ships with RLS OFF, same failure mode as CREATE TABLE. Works WITH or WITHOUT
+  // a FROM clause. It's a SELECT-INTO (not `INSERT INTO`/`MERGE INTO`) only when
+  // its ENCLOSING statement starts with SELECT or WITH — that's the reliable
+  // signal, so we don't need a FROM anchor. Skip:
   //  - matches inside a DO/function body (there `SELECT … INTO x` sets a VARIABLE),
   //  - TEMP/TEMPORARY (session-local, not API-reachable — UNLOGGED still needs RLS).
   const bodyRanges = executableBodyRanges(text)
-  const reSelectInto = new RegExp(`\\binto\\s+(?:(temp|temporary|unlogged)\\s+)?(?:table\\s+)?(${IDENT})\\s+from\\b`, 'gi')
+  const reSelectInto = new RegExp(`\\binto\\s+(?:(temp|temporary|unlogged)\\s+)?(?:table\\s+)?(${IDENT})`, 'gi')
   while ((m = reSelectInto.exec(text))) {
     if (inAnyRange(bodyRanges, m.index)) continue // PL/pgSQL SELECT INTO <var>
     const mod = (m[1] || '').toLowerCase()
     if (mod === 'temp' || mod === 'temporary') continue
+    // Enclosing statement (from the previous `;`) must be SELECT/WITH — not
+    // INSERT INTO / MERGE INTO, which also contain the word `into`.
+    const stmt = text.slice(text.lastIndexOf(';', m.index) + 1).replace(/^[\s(]+/, '')
+    if (!/^(select|with)\b/i.test(stmt)) continue
     const t = keyOf(m[2])
     if (SYSTEM_SCHEMAS.has(t.schema)) continue
     events.push({ type: 'create', key: t.key, display: t.display, ifne: false, file, line: lineAt(m.index), index: m.index })
@@ -235,7 +241,7 @@ export function scanSql(sql, file) {
     if (!m[0].trim()) { rePolicy.lastIndex++; continue } // guard against a zero-width match
     recreatedPolicies.add(objKey(m[1], m[2]))
     const body = m[3] || ''
-    if (/(using|with\s+check)\s*\(\s*true\s*\)/i.test(body) && isClientReachablePermissive(body)) {
+    if (/(using|with\s+check)\s*\(+\s*true\s*\)+/i.test(body) && isClientReachablePermissive(body)) {
       const t = keyOf(m[2])
       findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy uses USING (true) / WITH CHECK (true) reachable by a client role — it lets everyone through, RLS is effectively off` })
     }

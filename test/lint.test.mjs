@@ -204,6 +204,25 @@ test('#selectinto a TEMP select-into and a plain INSERT INTO are NOT flagged', (
   assert.equal(finalizeTables(scanSql('insert into logs select * from events;', 'm.sql').events).length, 0)
 })
 
+test('#selectinto SELECT ... INTO WITHOUT a FROM is still caught', () => {
+  const { events } = scanSql('select gen_random_uuid() into public.ids;', 'm.sql')
+  assert.equal(finalizeTables(events).filter((f) => f.rule === 'create_table_no_rls').length, 1)
+  // a CTE that ends in SELECT INTO too
+  const cte = 'with s as (select 1 x) select x into public.derived from s;'
+  assert.equal(finalizeTables(scanSql(cte, 'm.sql').events).filter((f) => f.rule === 'create_table_no_rls').length, 1)
+})
+
+// re-audit: nested parens must not slip past the flagship USING(true) check
+test('#nestedtrue USING((true)) / WITH CHECK(( true )) is flagged (nested parens)', () => {
+  assert.equal(scanSql('create policy p on public.t for select using ((true));', 'm.sql')
+    .findings.filter((f) => f.rule === 'permissive_true').length, 1)
+  assert.equal(scanSql('create policy p on public.t for insert with check (( true ));', 'm.sql')
+    .findings.filter((f) => f.rule === 'permissive_true').length, 1)
+  // a real predicate in parens is still NOT flagged
+  assert.equal(scanSql('create policy p on public.t for select using ((owner_id = auth.uid()));', 'm.sql')
+    .findings.filter((f) => f.rule === 'permissive_true').length, 0)
+})
+
 // ---- P2 fix #4: CREATE POLICY without a trailing ; ----
 test('#4 a permissive policy as the last statement WITHOUT a ; is still caught', () => {
   const { findings } = scanSql('create policy "open" on public.p for select using (true)', 'm.sql')
