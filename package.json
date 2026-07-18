@@ -1,6 +1,6 @@
 {
   "name": "airlock-migrate",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "The CI gate for dangerous Supabase/Postgres migrations. Fails your build when a migration ships a table without RLS, disables RLS, adds a USING (true) policy, or drops a policy/trigger. No database connection required.",
   "type": "module",
   "bin": {
