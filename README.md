@@ -47,6 +47,10 @@ Monitor watching production):
   (`USING (1 = 1)`, `USING (owner_id = owner_id)`) is *not* caught here — for
   full policy-logic analysis, run [Airlock RLS](https://shipsealed.com) against
   the live database.
+- **Views in a non-`public` schema** — `view_bypasses_rls` checks the `public`
+  schema, where the client (`anon` / `authenticated`) lives. A view in a custom
+  schema exposed to PostgREST via `db-schemas` isn't checked (same boundary as
+  the custom-role caveat below).
 - **Custom database roles** — a `USING (true)` policy is judged client-reachable
   when it targets `anon` / `authenticated` / `public` (or no `TO` clause). A
   policy scoped only to a *custom* role (`TO my_app_role`) is not flagged, because

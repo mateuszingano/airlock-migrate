@@ -356,8 +356,9 @@ test('#view a public view without security_invoker is flagged (RLS bypass)', () 
   const rules = sql => scanSql(sql, 'm.sql').findings.map(f => f.rule)
   assert.ok(rules('create view public.all_notes as select * from notes;').includes('view_bypasses_rls'))
   assert.ok(rules('create materialized view public.mv as select * from tenants;').includes('view_bypasses_rls'))
-  // opts into security_invoker → safe; a non-public (server-only) schema → not client-reachable
+  // opts into security_invoker (any PG boolean spelling) → safe; non-public schema → not client-reachable
   assert.ok(!rules('create view public.v with (security_invoker = on) as select * from notes;').includes('view_bypasses_rls'))
+  assert.ok(!rules('create view public.v with (security_invoker = yes) as select * from notes;').includes('view_bypasses_rls'))
   assert.ok(!rules('create view internal.v as select * from notes;').includes('view_bypasses_rls'))
 })
 

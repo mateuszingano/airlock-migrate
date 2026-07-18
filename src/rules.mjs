@@ -278,7 +278,7 @@ export function scanSql(sql, file) {
     const t = keyOf(m[2])
     if (t.schema !== 'public') continue // only the client-reachable schema
     const isMat = !!m[1]
-    const invoker = /security_invoker\s*=\s*(?:on|true|1)/i.test(m[3] || '')
+    const invoker = /security_invoker\s*=\s*(?:on|true|yes|1)/i.test(m[3] || '') // PG boolean spellings
     if (isMat || !invoker) {
       findings.push({ rule: 'view_bypasses_rls', severity: 'warn', file, line: lineAt(m.index), object: t.display,
         detail: isMat
