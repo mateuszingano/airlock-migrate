@@ -20,6 +20,7 @@
 import { access } from 'node:fs/promises'
 import { lint } from '../src/lint.mjs'
 import { enrich, toMarkdown, levelLabel } from '../src/report.mjs'
+import { reportRun } from '../src/report-ci.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -43,6 +44,8 @@ Options:
                      (a table/policy name). Also read from $MIGRATION_GUARD_ALLOW.
   --json             Print the result as JSON (includes level + fix per finding).
   --format <fmt>     text (default) or markdown (AI-ready, with fixes to paste).
+  --token <t>        Send this run to your Airlock account (history, alerts, team
+                     dashboard). Free without it. Also read from $AIRLOCK_TOKEN.
   -h, --help         Show this help.
   -v, --version      Show the version.
 
@@ -62,7 +65,7 @@ function splitList(v) {
 class UsageError extends Error {}
 
 function parseArgs(argv) {
-  const opts = { dir: undefined, json: false, format: 'text', allow: [] }
+  const opts = { dir: undefined, json: false, format: 'text', allow: [], token: undefined, endpoint: undefined }
   const positional = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -74,11 +77,17 @@ function parseArgs(argv) {
     else if (a === '--markdown' || a === '--md') opts.format = 'markdown'
     else if (a === '--allow') opts.allow = splitList(argv[++i])
     else if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
+    else if (a === '--token') opts.token = argv[++i]
+    else if (a.startsWith('--token=')) opts.token = a.slice('--token='.length)
+    else if (a === '--endpoint') opts.endpoint = argv[++i]
+    else if (a.startsWith('--endpoint=')) opts.endpoint = a.slice('--endpoint='.length)
     else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
     else positional.push(a)
   }
   opts.dir = positional[0] || DEFAULT_DIR
   opts.allow = [...splitList(process.env.MIGRATION_GUARD_ALLOW), ...opts.allow]
+  opts.token = opts.token || process.env.AIRLOCK_TOKEN
+  opts.endpoint = opts.endpoint || process.env.AIRLOCK_ENDPOINT
   return opts
 }
 
@@ -147,6 +156,15 @@ async function main() {
   if (opts.json) console.log(JSON.stringify(r, null, 2))
   else if (opts.format === 'markdown') console.log(toMarkdown(r))
   else report(r, opts.dir)
+
+  // Paid connector: if a token is set, send the run up to the Airlock account
+  // (history/alerts/team). Fire-and-forget — never changes the exit code.
+  if (opts.token) {
+    const sent = await reportRun(r, { tool: 'airlock-migrate', version: await readVersion(), token: opts.token, endpoint: opts.endpoint })
+    if (!opts.json && opts.format !== 'markdown') {
+      console.log(sent.sent ? `${DIM}↑ reported to your Airlock account.${RESET}` : `${DIM}↑ Airlock report skipped (${sent.reason || sent.status}).${RESET}`)
+    }
+  }
 
   return r.passed ? 0 : 1
 }
