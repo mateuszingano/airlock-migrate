@@ -181,6 +181,29 @@ test('#3 a TEMP / TEMPORARY table is session-local and NOT flagged', () => {
   assert.equal(finalizeTables(scanSql('create temporary table t2 (id int);', 'm.sql').events).length, 0)
 })
 
+// P3 re-audit: SELECT ... INTO creates a table with RLS OFF
+test('#selectinto SELECT ... INTO <table> without RLS is a fail', () => {
+  const { events } = scanSql('select * into public.report from sales;', 'm.sql')
+  assert.equal(finalizeTables(events).filter((f) => f.rule === 'create_table_no_rls').length, 1)
+})
+
+test('#selectinto SELECT INTO followed by ENABLE RLS is clean', () => {
+  const sql = 'select * into public.report from sales; alter table public.report enable row level security;'
+  assert.equal(finalizeTables(scanSql(sql, 'm.sql').events).length, 0)
+})
+
+test('#selectinto PL/pgSQL SELECT INTO <var> inside a body is NOT a table (no false positive)', () => {
+  const fn = 'create function f() returns void as $$ begin select id into rec from t; end $$ language plpgsql;'
+  assert.equal(finalizeTables(scanSql(fn, 'm.sql').events).length, 0)
+  const doblk = 'do $$ begin select id into v from t; end $$;'
+  assert.equal(finalizeTables(scanSql(doblk, 'm.sql').events).length, 0)
+})
+
+test('#selectinto a TEMP select-into and a plain INSERT INTO are NOT flagged', () => {
+  assert.equal(finalizeTables(scanSql('select * into temp scratch from t;', 'm.sql').events).length, 0)
+  assert.equal(finalizeTables(scanSql('insert into logs select * from events;', 'm.sql').events).length, 0)
+})
+
 // ---- P2 fix #4: CREATE POLICY without a trailing ; ----
 test('#4 a permissive policy as the last statement WITHOUT a ; is still caught', () => {
   const { findings } = scanSql('create policy "open" on public.p for select using (true)', 'm.sql')

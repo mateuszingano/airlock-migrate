@@ -127,6 +127,24 @@ function objKey(name, tableIdent) {
 // A USING (true) / WITH CHECK (true) policy only leaks if a CLIENT role can reach
 // it. It's safe when scoped only to trusted server roles (service_role bypasses
 // RLS anyway), and a RESTRICTIVE (true) policy is a no-op restriction, not a grant.
+// Ranges of executable dollar bodies (`do $$…$$`, `… as $$…$$`) in the stripped
+// text — inside these, `SELECT … INTO x` assigns a PL/pgSQL VARIABLE, not a table.
+function executableBodyRanges(text) {
+  const ranges = []
+  const re = /\b(?:do|as)\s+(\$[A-Za-z_0-9]*\$)/gi
+  let m
+  while ((m = re.exec(text))) {
+    const tag = m[1]
+    const bodyStart = m.index + m[0].length
+    const close = text.indexOf(tag, bodyStart)
+    const end = close === -1 ? text.length : close + tag.length
+    ranges.push([m.index, end])
+    re.lastIndex = end
+  }
+  return ranges
+}
+const inAnyRange = (ranges, i) => ranges.some(([a, b]) => i >= a && i < b)
+
 function isClientReachablePermissive(body) {
   if (/\bas\s+restrictive\b/i.test(body)) return false
   const to = /\bto\s+([\w",\s]+?)(?:\s+using\b|\s+with\s+check\b|\s*;|\s*$)/i.exec(body)
@@ -168,6 +186,22 @@ export function scanSql(sql, file) {
     // comes after the column list and IS a real table that still needs RLS.
     if (/^\s*partition\s+of\b/i.test(text.slice(m.index + m[0].length))) continue
     events.push({ type: 'create', key: t.key, display: t.display, ifne: !!m[2], file, line: lineAt(m.index), index: m.index })
+  }
+
+  // SELECT ... INTO <table> FROM ... — creates a NEW table (like CREATE TABLE AS)
+  // that ships with RLS OFF, same failure mode as CREATE TABLE. `INTO … FROM` is
+  // distinctive of SELECT-INTO (INSERT INTO never has `INTO name FROM`). Skip:
+  //  - matches inside a DO/function body (there `SELECT … INTO x` sets a VARIABLE),
+  //  - TEMP/TEMPORARY (session-local, not API-reachable — UNLOGGED still needs RLS).
+  const bodyRanges = executableBodyRanges(text)
+  const reSelectInto = new RegExp(`\\binto\\s+(?:(temp|temporary|unlogged)\\s+)?(?:table\\s+)?(${IDENT})\\s+from\\b`, 'gi')
+  while ((m = reSelectInto.exec(text))) {
+    if (inAnyRange(bodyRanges, m.index)) continue // PL/pgSQL SELECT INTO <var>
+    const mod = (m[1] || '').toLowerCase()
+    if (mod === 'temp' || mod === 'temporary') continue
+    const t = keyOf(m[2])
+    if (SYSTEM_SCHEMAS.has(t.schema)) continue
+    events.push({ type: 'create', key: t.key, display: t.display, ifne: false, file, line: lineAt(m.index), index: m.index })
   }
 
   // ALTER TABLE ... ENABLE ROW LEVEL SECURITY

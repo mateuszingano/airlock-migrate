@@ -57,9 +57,12 @@ Monitor watching production):
 
 What it now covers that the docs used to omit: **`UNLOGGED` and `FOREIGN` tables**
 are scanned for missing RLS just like ordinary tables (`TEMP` tables are session-
-local, so they're correctly skipped); a dollar-quoted **data** string
-(`select $doc$ … $doc$`) is treated as data, while a `DO` block / function body
-stays analyzed (including a dynamic `execute '… disable rls …'` inside it).
+local, so they're correctly skipped); **`SELECT … INTO <table> FROM …`** (which
+creates a table with RLS off, like `CREATE TABLE AS`) is caught too — while the
+PL/pgSQL `SELECT … INTO <var>` inside a `DO`/function body (a variable, not a
+table) is correctly ignored; a dollar-quoted **data** string (`select $doc$ …
+$doc$`) is treated as data, while a `DO` block / function body stays analyzed
+(including a dynamic `execute '… disable rls …'` inside it).
 
 ## In CI (GitHub Actions)
 
