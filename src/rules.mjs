@@ -21,8 +21,14 @@ const SYSTEM_SCHEMAS = new Set([
 // Neutralize comments and string literals so their contents can't trip a rule
 // (a `--` inside a string must NOT eat the statement after it, and a keyword
 // inside a string or comment must not be mistaken for DDL). Newlines are kept so
-// reported line numbers stay accurate. Dollar-quoted bodies ($$...$$) are left
-// intact on purpose — idempotent migrations put real DDL inside DO blocks.
+// reported line numbers stay accurate.
+//
+// Dollar-quoted bodies are handled by CONTEXT: a DO block or a function body
+// (`do $$…$$`, `… as $$…$$`) is real executable DDL and is KEPT intact so it gets
+// analyzed (incl. dynamic `execute '…disable rls…'` inside it — a correct catch).
+// A dollar-quoted STRING used as DATA (`select $doc$ … $doc$`, a default, an
+// inserted value) is BLANKED like a single-quoted string, so a keyword sitting in
+// documentation/seed text can't raise a false positive.
 export function stripComments(sql) {
   let out = ''
   let i = 0
@@ -60,7 +66,20 @@ export function stripComments(sql) {
     if (c === "'") { inStr = true; out += c; i++; continue }
     if (c === '$') {
       const m = /^\$[A-Za-z_0-9]*\$/.exec(sql.slice(i))
-      if (m) { dollar = m[0]; out += m[0]; i += m[0].length; continue }
+      if (m) {
+        const tag = m[0]
+        // Executable only when the token just before the opener is `do` or `as`
+        // (a DO block or a function body). Otherwise it's a data string → blank.
+        const prev = /([A-Za-z_]+)\s*$/.exec(out)
+        const executable = !!prev && (prev[1].toLowerCase() === 'do' || prev[1].toLowerCase() === 'as')
+        if (executable) { dollar = tag; out += tag; i += tag.length; continue }
+        // Blank the whole dollar-quoted string (preserve newlines for line numbers).
+        const close = sql.indexOf(tag, i + tag.length)
+        const bodyEnd = close === -1 ? n : close + tag.length
+        for (let j = i; j < bodyEnd; j++) out += sql[j] === '\n' ? '\n' : ' '
+        i = bodyEnd
+        continue
+      }
     }
     out += c
     i++
@@ -68,10 +87,21 @@ export function stripComments(sql) {
   return out
 }
 
-function lineOf(text, index) {
-  let line = 1
-  for (let i = 0; i < index && i < text.length; i++) if (text[i] === '\n') line++
-  return line
+// Build an O(log n) index→line lookup once per file, instead of rescanning from
+// the start on every match (which made a single large .sql O(n·matches)).
+function makeLineOf(text) {
+  const nl = [] // absolute indices of each '\n'
+  for (let i = 0; i < text.length; i++) if (text[i] === '\n') nl.push(i)
+  return (index) => {
+    let lo = 0
+    let hi = nl.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (nl[mid] < index) lo = mid + 1
+      else hi = mid
+    }
+    return lo + 1 // newlines strictly before index === line - 1
+  }
 }
 
 function unquote(s) {
@@ -115,6 +145,7 @@ function isClientReachablePermissive(body) {
  */
 export function scanSql(sql, file) {
   const text = stripComments(sql)
+  const lineAt = makeLineOf(text)
   const events = [] // ordered create/enable/drop of tables — order handles drop-then-recreate
   const droppedPolicies = []
   const recreatedPolicies = new Set()
@@ -123,17 +154,20 @@ export function scanSql(sql, file) {
   const findings = []
   let m
 
-  // CREATE TABLE — an ordered event, keeping the "if not exists" flag
-  const reCreate = new RegExp(`create\\s+table\\s+(if\\s+not\\s+exists\\s+)?(${IDENT})`, 'gi')
+  // CREATE TABLE — an ordered event, keeping the "if not exists" flag. Also covers
+  // UNLOGGED and FOREIGN tables (both ship RLS-off and are client-reachable), but
+  // NOT TEMP/TEMPORARY (session-local, never reachable by the API roles) — those
+  // simply don't match `create (unlogged|foreign)? table`.
+  const reCreate = new RegExp(`create\\s+(?:(unlogged|foreign)\\s+)?table\\s+(if\\s+not\\s+exists\\s+)?(${IDENT})`, 'gi')
   while ((m = reCreate.exec(text))) {
-    const t = keyOf(m[2])
+    const t = keyOf(m[3])
     if (SYSTEM_SCHEMAS.has(t.schema)) continue
     // A `... PARTITION OF parent` child inherits the parent's RLS — it never
     // gets (or needs) its own ENABLE, so it isn't a table shipped without RLS.
     // Skip it. NOTE: only `PARTITION OF` (the child); a `PARTITION BY` parent
     // comes after the column list and IS a real table that still needs RLS.
     if (/^\s*partition\s+of\b/i.test(text.slice(m.index + m[0].length))) continue
-    events.push({ type: 'create', key: t.key, display: t.display, ifne: !!m[1], file, line: lineOf(text, m.index), index: m.index })
+    events.push({ type: 'create', key: t.key, display: t.display, ifne: !!m[2], file, line: lineAt(m.index), index: m.index })
   }
 
   // ALTER TABLE ... ENABLE ROW LEVEL SECURITY
@@ -152,17 +186,24 @@ export function scanSql(sql, file) {
   const reDisable = new RegExp(`alter\\s+table\\s+(?:only\\s+)?(${IDENT})\\s+disable\\s+row\\s+level\\s+security`, 'gi')
   while ((m = reDisable.exec(text))) {
     const t = keyOf(m[1])
-    findings.push({ rule: 'disable_rls', severity: 'fail', file, line: lineOf(text, m.index), object: t.display, detail: `RLS turned OFF — every row in ${t.display} becomes readable by anyone with the anon key` })
+    findings.push({ rule: 'disable_rls', severity: 'fail', file, line: lineAt(m.index), object: t.display, detail: `RLS turned OFF — every row in ${t.display} becomes readable by anyone with the anon key` })
   }
 
-  // CREATE POLICY: record the recreate, and flag USING (true) / WITH CHECK (true)
-  const rePolicy = new RegExp(`create\\s+policy\\s+(${NAME})\\s+on\\s+(${IDENT})([\\s\\S]*?);`, 'gi')
+  // CREATE POLICY: record the recreate, and flag USING (true) / WITH CHECK (true).
+  // The body ends at the first `;`, OR (if the `;` was omitted) at the next
+  // `create policy` / end of file — so a missing terminator neither drops the
+  // policy (false negative) nor bleeds into and mis-flags the following one.
+  const rePolicy = new RegExp(
+    `create\\s+policy\\s+(${NAME})\\s+on\\s+(${IDENT})([\\s\\S]*?)(?:;|(?=\\bcreate\\s+policy\\b)|$)`,
+    'gi'
+  )
   while ((m = rePolicy.exec(text))) {
+    if (!m[0].trim()) { rePolicy.lastIndex++; continue } // guard against a zero-width match
     recreatedPolicies.add(objKey(m[1], m[2]))
     const body = m[3] || ''
     if (/(using|with\s+check)\s*\(\s*true\s*\)/i.test(body) && isClientReachablePermissive(body)) {
       const t = keyOf(m[2])
-      findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineOf(text, m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy uses USING (true) / WITH CHECK (true) reachable by a client role — it lets everyone through, RLS is effectively off` })
+      findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy uses USING (true) / WITH CHECK (true) reachable by a client role — it lets everyone through, RLS is effectively off` })
     }
   }
 
@@ -174,14 +215,14 @@ export function scanSql(sql, file) {
   const reDropPol = new RegExp(`drop\\s+policy\\s+(?:if\\s+exists\\s+)?(${NAME})\\s+on\\s+(${IDENT})`, 'gi')
   while ((m = reDropPol.exec(text))) {
     const t = keyOf(m[2])
-    droppedPolicies.push({ key: objKey(m[1], m[2]), file, line: lineOf(text, m.index), object: `${unquote(m[1])} on ${t.display}`, table: t.display })
+    droppedPolicies.push({ key: objKey(m[1], m[2]), file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, table: t.display })
   }
 
   // DROP TRIGGER → candidate warn (our scar: on_auth_user_created went missing this way)
   const reDropTrg = new RegExp(`drop\\s+trigger\\s+(?:if\\s+exists\\s+)?(${NAME})\\s+on\\s+(${IDENT})`, 'gi')
   while ((m = reDropTrg.exec(text))) {
     const t = keyOf(m[2])
-    droppedTriggers.push({ key: objKey(m[1], m[2]), file, line: lineOf(text, m.index), object: `${unquote(m[1])} on ${t.display}`, table: t.display })
+    droppedTriggers.push({ key: objKey(m[1], m[2]), file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, table: t.display })
   }
 
   events.sort((a, b) => a.index - b.index)

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { scanSql, finalizeTables, finalizeDrops, stripComments } from '../src/rules.mjs'
 import { lint } from '../src/lint.mjs'
 import { levelOf, fixFor, enrich, toMarkdown } from '../src/report.mjs'
+import { buildPayload, reportRun } from '../src/report-ci.mjs'
 
 const fx = (name) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))
 
@@ -145,6 +146,74 @@ test('DDL inside a DO $$ block is still analyzed (create+enable balances)', () =
   assert.equal(finalizeTables(events).length, 0)
 })
 
+// ---- P2 fix #1: dollar-quoted DATA string is not analyzed as code ----
+test('#1 a dollar-quoted STRING used as data does NOT trip a rule (was a false positive)', () => {
+  const sql = 'select $doc$ alter table public.p disable row level security $doc$ as note;'
+  const { findings } = scanSql(sql, 'm.sql')
+  assert.equal(findings.length, 0)
+})
+
+test('#1 a create table inside a dollar-quoted data string is NOT counted', () => {
+  const sql = "insert into docs (body) values ($x$ create table public.leak (id int) $x$);"
+  const { events } = scanSql(sql, 'm.sql')
+  assert.equal(finalizeTables(events).length, 0)
+})
+
+test('#1 dynamic execute of a DISABLE inside a DO block IS still caught (real DDL)', () => {
+  const sql = "do $$ begin execute 'alter table public.p disable row level security'; end $$;"
+  const { findings } = scanSql(sql, 'm.sql')
+  assert.equal(findings.filter((f) => f.rule === 'disable_rls').length, 1)
+})
+
+// ---- P2 fix #3: UNLOGGED / FOREIGN tables are scanned; TEMP is not ----
+test('#3 create UNLOGGED table without RLS is a fail', () => {
+  const { events } = scanSql('create unlogged table public.u (id int);', 'm.sql')
+  assert.equal(finalizeTables(events).filter((f) => f.rule === 'create_table_no_rls').length, 1)
+})
+
+test('#3 create FOREIGN table without RLS is a fail', () => {
+  const { events } = scanSql('create foreign table public.f (id int) server s;', 'm.sql')
+  assert.equal(finalizeTables(events).filter((f) => f.rule === 'create_table_no_rls').length, 1)
+})
+
+test('#3 a TEMP / TEMPORARY table is session-local and NOT flagged', () => {
+  assert.equal(finalizeTables(scanSql('create temp table t (id int);', 'm.sql').events).length, 0)
+  assert.equal(finalizeTables(scanSql('create temporary table t2 (id int);', 'm.sql').events).length, 0)
+})
+
+// ---- P2 fix #4: CREATE POLICY without a trailing ; ----
+test('#4 a permissive policy as the last statement WITHOUT a ; is still caught', () => {
+  const { findings } = scanSql('create policy "open" on public.p for select using (true)', 'm.sql')
+  assert.equal(findings.filter((f) => f.rule === 'permissive_true').length, 1)
+})
+
+test('#4 a missing ; does not bleed into and mis-flag the next policy', () => {
+  // "a" is scoped (safe) but has no ;, "b" is the permissive one — only b must flag.
+  const sql =
+    'create policy "a" on public.p for select using (owner_id = auth.uid()) ' +
+    'create policy "b" on public.p for select using (true);'
+  const { findings } = scanSql(sql, 'm.sql')
+  const flagged = findings.filter((f) => f.rule === 'permissive_true')
+  assert.equal(flagged.length, 1)
+  assert.match(flagged[0].object, /^b on/)
+})
+
+// ---- P2 fix #2: line numbers correct + large file scans fast ----
+test('#2 line numbers are correct across many lines (binary-search lookup)', () => {
+  const sql = 'select 1;\n'.repeat(500) + 'alter table public.p disable row level security;'
+  const { findings } = scanSql(sql, 'm.sql')
+  assert.equal(findings[0].line, 501)
+})
+
+test('#2 a large single file scans fast (no quadratic lineOf)', () => {
+  const sql = 'create table public.t (id int); alter table public.t enable row level security;\n'.repeat(8000)
+  const start = Date.now()
+  const { events } = scanSql(sql, 'm.sql')
+  const ms = Date.now() - start
+  assert.equal(finalizeTables(events).length, 0) // every table is enabled
+  assert.ok(ms < 2000, `scan took ${ms}ms — expected < 2000ms (perf guard)`)
+})
+
 test('lint(leaky) fails with the expected rules', async () => {
   const r = await lint({ files: [fx('leaky.sql')] })
   assert.equal(r.passed, false)
@@ -152,6 +221,35 @@ test('lint(leaky) fails with the expected rules', async () => {
   for (const expected of ['create_table_no_rls', 'permissive_true', 'disable_rls', 'drop_trigger']) {
     assert.ok(rules.has(expected), `expected rule ${expected}`)
   }
+})
+
+test('report-ci: builds a payload with tool, verdict and findings', () => {
+  const p = buildPayload({ passed: false, problems: 1, warnings: 0, findings: [{ rule: 'disable_rls', severity: 'fail', file: 'm.sql', line: 3, object: 'public.p', detail: 'x' }] }, { tool: 'airlock-migrate', version: '0.2.0' })
+  assert.equal(p.tool, 'airlock-migrate')
+  assert.equal(p.passed, false)
+  assert.equal(p.findings.length, 1)
+  assert.equal(p.findings[0].rule, 'disable_rls')
+})
+
+test('report-ci: no token → nothing is sent (stays free)', async () => {
+  let called = false
+  const res = await reportRun({ passed: true, findings: [] }, { tool: 't', version: '1', fetchImpl: async () => ((called = true), { ok: true }) })
+  assert.equal(res.sent, false)
+  assert.equal(called, false)
+})
+
+test('report-ci: with a token → POSTs to /api/ci/ingest with Bearer auth', async () => {
+  let seen
+  const fetchImpl = async (url, opts) => ((seen = { url, opts }), { ok: true, status: 200 })
+  const res = await reportRun({ passed: false, problems: 1, findings: [] }, { tool: 'airlock-migrate', version: '0.2.0', token: 'tok_123', fetchImpl })
+  assert.equal(res.sent, true)
+  assert.match(seen.url, /\/api\/ci\/ingest$/)
+  assert.equal(seen.opts.headers.Authorization, 'Bearer tok_123')
+})
+
+test('report-ci: a network error never throws (build is never broken)', async () => {
+  const res = await reportRun({ findings: [] }, { tool: 't', version: '1', token: 'x', fetchImpl: async () => { throw new Error('boom') } })
+  assert.equal(res.sent, false)
 })
 
 test('report: severity is graded and the fix is concrete', () => {

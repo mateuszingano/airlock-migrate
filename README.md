@@ -48,8 +48,18 @@ Monitor watching production):
   (`USING (1 = 1)`, `USING (owner_id = owner_id)`) is *not* caught here — for
   full policy-logic analysis, run [Airlock RLS](https://shipsealed.com) against
   the live database.
+- **Custom database roles** — a `USING (true)` policy is judged client-reachable
+  when it targets `anon` / `authenticated` / `public` (or no `TO` clause). A
+  policy scoped only to a *custom* role (`TO my_app_role`) is not flagged, because
+  whether that role is client-reachable can't be decided from the SQL alone.
 - **Grants to `anon` / `service_role`** — intentionally *not* flagged (RLS is the
   gate; flagging them buries you in noise on a normal Supabase schema).
+
+What it now covers that the docs used to omit: **`UNLOGGED` and `FOREIGN` tables**
+are scanned for missing RLS just like ordinary tables (`TEMP` tables are session-
+local, so they're correctly skipped); a dollar-quoted **data** string
+(`select $doc$ … $doc$`) is treated as data, while a `DO` block / function body
+stays analyzed (including a dynamic `execute '… disable rls …'` inside it).
 
 ## In CI (GitHub Actions)
 
