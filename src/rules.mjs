@@ -241,7 +241,10 @@ export function scanSql(sql, file) {
     if (!m[0].trim()) { rePolicy.lastIndex++; continue } // guard against a zero-width match
     recreatedPolicies.add(objKey(m[1], m[2]))
     const body = m[3] || ''
-    if (/(using|with\s+check)\s*\(+\s*true\s*\)+/i.test(body) && isClientReachablePermissive(body)) {
+    // `(?:\(\s*)+ … (?:\s*\))+` tolerates ANY nesting/spacing/tabs between the
+    // parens — `USING (true)`, `((true))`, `( (true) )`, `(  ( true )  )` all match
+    // (comments were already stripped). `\(+` alone missed the spaced variants.
+    if (/(using|with\s+check)\s*(?:\(\s*)+true(?:\s*\))+/i.test(body) && isClientReachablePermissive(body)) {
       const t = keyOf(m[2])
       findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy uses USING (true) / WITH CHECK (true) reachable by a client role — it lets everyone through, RLS is effectively off` })
     }

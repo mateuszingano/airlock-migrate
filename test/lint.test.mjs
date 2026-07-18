@@ -223,6 +223,28 @@ test('#nestedtrue USING((true)) / WITH CHECK(( true )) is flagged (nested parens
     .findings.filter((f) => f.rule === 'permissive_true').length, 0)
 })
 
+// re-audit follow-up: SPACED / tabbed nesting must not escape either
+test('#spacedtrue USING with spaces/tabs between the parens is still flagged', () => {
+  const variants = [
+    'create policy p on public.t for select using ( (true) );',
+    'create policy p on public.t for select using (  ( true )  );',
+    'create policy p on public.t for select using (\t(\ttrue\t)\t);',
+    'create policy p on public.t for select using ( ( ( true ) ) );',
+    'create policy p on public.t for insert with check ( ( true ) );',
+    'create policy p on public.t for select using (\n  ( true )\n);',
+  ]
+  for (const sql of variants) {
+    assert.equal(
+      scanSql(sql, 'm.sql').findings.filter((f) => f.rule === 'permissive_true').length,
+      1,
+      `expected flagged: ${JSON.stringify(sql)}`
+    )
+  }
+  // a spaced real predicate stays clean
+  assert.equal(scanSql('create policy p on public.t for select using ( ( status = 1 ) );', 'm.sql')
+    .findings.filter((f) => f.rule === 'permissive_true').length, 0)
+})
+
 // ---- P2 fix #4: CREATE POLICY without a trailing ; ----
 test('#4 a permissive policy as the last statement WITHOUT a ; is still caught', () => {
   const { findings } = scanSql('create policy "open" on public.p for select using (true)', 'm.sql')
