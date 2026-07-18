@@ -20,13 +20,19 @@ npx airlock-migrate ./db/migrations
 |------|-------|---------|
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
 | `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` |
-| `permissive_true` | fail | `CREATE POLICY ... USING (true)` / `WITH CHECK (true)` |
+| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0` — reachable by a client role |
 | `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
 | `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
 | `drop_policy` | warn | a policy dropped and never re-created |
 | `drop_trigger` | warn | a trigger dropped and never re-created (how signup logic silently goes missing) |
 
 Only **fail** findings break the build. Warnings are printed for review.
+
+The tautology check evaluates *constant* and *reflexive* predicates statically. A
+predicate that is always-true only through a function or the auth token itself
+(`is_admin() OR true` with an unknown helper, `auth.uid() IS NOT NULL`) is policy
+*logic*, not migration text — run [Airlock RLS](https://shipsealed.com) against the
+live database for that.
 
 **No false alarms by design.** Supabase's normal baseline grants (`GRANT ... TO
 anon` / `service_role` on every object) are *not* flagged — RLS is the gate
@@ -42,11 +48,6 @@ Migration Guard focuses on the RLS / table failure mode. These vectors can also
 leak and are **not** flagged yet — review them yourself (or keep the Airlock
 Monitor watching production):
 
-- **Non-literal permissive predicates** — a policy is flagged on the literal
-  `USING (true)` / `WITH CHECK (true)`. A tautology written another way
-  (`USING (1 = 1)`, `USING (owner_id = owner_id)`) is *not* caught here — for
-  full policy-logic analysis, run [Airlock RLS](https://shipsealed.com) against
-  the live database.
 - **Views in a non-`public` schema** — `view_bypasses_rls` checks the `public`
   schema, where the client (`anon` / `authenticated`) lives. A view in a custom
   schema exposed to PostgREST via `db-schemas` isn't checked (same boundary as

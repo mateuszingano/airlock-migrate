@@ -152,6 +152,105 @@ function isClientReachablePermissive(body) {
   return /\b(anon|authenticated|public)\b/i.test(to[1])
 }
 
+// The balanced content of the first `using (...)` / `with check (...)` in a policy
+// body (kw is a regex source: 'using' or 'with\\s+check'), or null.
+function predicateOf(body, kw) {
+  const m = new RegExp(`\\b${kw}\\b`, 'i').exec(body)
+  if (!m) return null
+  const open = body.indexOf('(', m.index + m[0].length)
+  if (open === -1) return null
+  let depth = 0
+  for (let j = open; j < body.length; j++) {
+    if (body[j] === '(') depth++
+    else if (body[j] === ')') { depth--; if (depth === 0) return body.slice(open + 1, j) }
+  }
+  return null
+}
+
+// Do fully-balanced outer parens wrap the whole string?
+function outerParenWrapsAll(s) {
+  if (!s.startsWith('(') || !s.endsWith(')')) return false
+  let depth = 0
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(') depth++
+    else if (s[i] === ')') { depth--; if (depth === 0) return i === s.length - 1 }
+  }
+  return false
+}
+
+// Split a boolean expression on `OR` at paren-depth 0.
+function splitTopOr(s) {
+  const parts = []
+  let depth = 0, last = 0
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(') depth++
+    else if (s[i] === ')') depth--
+    else if (depth === 0 && s.startsWith(' or ', i)) { parts.push(s.slice(last, i)); i += 3; last = i + 1 }
+  }
+  parts.push(s.slice(last))
+  return parts.map((p) => p.trim())
+}
+
+// Is this policy predicate a CONSTANT tautology — always true regardless of the
+// row? Covers: literal `true`, a constant comparison (`1=1`, `2>1`, `'a'='a'`), a
+// REFLEXIVE equality on the identical operand (`owner_id = owner_id`), and a
+// top-level OR of those. Deliberately NOT a column-vs-literal (`is_active = true`)
+// or a function — those are real predicates. This closes the `USING(1=1)` gap
+// without the false positives that fuller policy-logic analysis risks.
+function isConstTautology(pred) {
+  let s = String(pred).toLowerCase().replace(/\s+/g, ' ').trim()
+  while (outerParenWrapsAll(s)) s = s.slice(1, -1).trim()
+  if (s === 'true') return true
+  const parts = splitTopOr(s)
+  if (parts.length > 1) return parts.some(isConstTautology)
+  const OPERAND = "'[^']*'|[\\w.]+"
+  const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
+  if (refl && refl[1] === refl[2]) return true // owner_id = owner_id
+  const cmp = new RegExp(`^(-?\\d+(?:\\.\\d+)?|'[^']*')\\s*(=|<>|!=|<=|>=|<|>)\\s*(-?\\d+(?:\\.\\d+)?|'[^']*')$`).exec(s)
+  if (cmp) {
+    const [, a, op, b] = cmp
+    const aStr = a.startsWith("'"), bStr = b.startsWith("'")
+    if (aStr !== bStr) return false // mixed types → don't guess
+    const va = aStr ? a : parseFloat(a), vb = bStr ? b : parseFloat(b)
+    switch (op) {
+      case '=': return va === vb
+      case '<>': case '!=': return va !== vb
+      case '<': return va < vb
+      case '>': return va > vb
+      case '<=': return va <= vb
+      case '>=': return va >= vb
+    }
+  }
+  // a CONSTANT in a CONSTANT list: `1 in (1)`, `'a' in ('a','b')` (a column left
+  // side stays unevaluated — `email in (select …)` is a real scope, not a tautology)
+  const inm = new RegExp(`^(${OPERAND})\\s+in\\s*\\((.+)\\)$`).exec(s)
+  if (inm) {
+    const CONST = /^(?:-?\d+(?:\.\d+)?|'[^']*')$/
+    if (!CONST.test(inm[1].trim())) return false
+    const list = inm[2].split(',').map((x) => x.trim())
+    if (list.length && list.every((x) => CONST.test(x))) return list.includes(inm[1].trim())
+    return false
+  }
+  // a non-negative built-in the comparison can't falsify: `length(x) >= 0`
+  const nn = /^(?:length|char_length|character_length|octet_length|bit_length|cardinality)\s*\(.*\)\s*(>=|>|<>|!=)\s*(-?\d+(?:\.\d+)?)$/.exec(s)
+  if (nn) {
+    const n = parseFloat(nn[2])
+    if (nn[1] === '>=') return n <= 0
+    if (nn[1] === '>') return n < 0
+    if (nn[1] === '<>' || nn[1] === '!=') return n < 0
+  }
+  return false
+}
+
+// Is either the USING or the WITH CHECK predicate an always-true constant tautology?
+function hasTautologyPredicate(body) {
+  for (const kw of ['using', 'with\\s+check']) {
+    const p = predicateOf(body, kw)
+    if (p != null && isConstTautology(p)) return true
+  }
+  return false
+}
+
 /**
  * Scan a single migration file.
  * @returns {{
@@ -244,9 +343,12 @@ export function scanSql(sql, file) {
     // `(?:\(\s*)+ … (?:\s*\))+` tolerates ANY nesting/spacing/tabs between the
     // parens — `USING (true)`, `((true))`, `( (true) )`, `(  ( true )  )` all match
     // (comments were already stripped). `\(+` alone missed the spaced variants.
-    if (/(using|with\s+check)\s*(?:\(\s*)+true(?:\s*\))+/i.test(body) && isClientReachablePermissive(body)) {
+    // `USING (true)` literal, OR a constant tautology (`USING (1=1)`,
+    // `USING (owner_id = owner_id)`, `USING (2 > 1)`) that reduces to always-true.
+    const litTrue = /(using|with\s+check)\s*(?:\(\s*)+true(?:\s*\))+/i.test(body)
+    if ((litTrue || hasTautologyPredicate(body)) && isClientReachablePermissive(body)) {
       const t = keyOf(m[2])
-      findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy uses USING (true) / WITH CHECK (true) reachable by a client role — it lets everyone through, RLS is effectively off` })
+      findings.push({ rule: 'permissive_true', severity: 'fail', file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, detail: `policy predicate is always true (USING (true) / (1=1) / (col = col)) and is reachable by a client role — it lets everyone through, RLS is effectively off` })
     }
   }
 

@@ -373,3 +373,17 @@ test('#definer a SECURITY DEFINER function without a pinned search_path is flagg
   assert.ok(!rules("create function f() returns trigger language plpgsql set search_path='' security definer as $$ begin return new; end $$;").includes('definer_no_search_path'))
   assert.ok(!rules('create function f() returns int language sql as $$ select 1 $$;').includes('definer_no_search_path'))
 })
+
+// NEW COVERAGE (was declared "not covered yet"): a policy predicate that reduces to
+// a CONSTANT tautology — 1=1, 2>1, reflexive col=col, 1 in (1), length()>=0 — is
+// as permissive as USING(true). A column-vs-literal or real column stays clean.
+test('#tautology a constant/reflexive always-true predicate is flagged; real predicates are not', () => {
+  const hit = u => scanSql(`create policy p on public.t for select to anon using (${u});`, 'm.sql').findings.some(f => f.rule === 'permissive_true')
+  for (const u of ['1=1', '2 > 1', "'a' = 'a'", 'owner_id = owner_id', '((1=1))', 'tenant = owner OR 2=2', '1 in (1)', 'length(name) >= 0'])
+    assert.ok(hit(u), `expected ${u} flagged as always-true`)
+  for (const u of ['is_active = true', 'owner_id = auth.uid()', "status = 'active'", '1=2', 'tenant_id = owner_id', 'a = b', 'role in (\'a\',\'b\')', 'email in (select id from admins)'])
+    assert.ok(!hit(u), `expected ${u} NOT flagged`)
+  // restrictive / server-role stay clean even when always-true
+  assert.ok(!scanSql('create policy p on public.t as restrictive for select to anon using (1=1);', 'm.sql').findings.some(f => f.rule === 'permissive_true'))
+  assert.ok(!scanSql('create policy p on public.t for select to service_role using (1=1);', 'm.sql').findings.some(f => f.rule === 'permissive_true'))
+})
