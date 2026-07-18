@@ -268,6 +268,40 @@ export function scanSql(sql, file) {
     droppedTriggers.push({ key: objKey(m[1], m[2]), file, line: lineAt(m.index), object: `${unquote(m[1])} on ${t.display}`, table: t.display })
   }
 
+  // CREATE VIEW / MATERIALIZED VIEW in the client-reachable `public` schema. A view
+  // runs with its OWNER's rights unless `security_invoker` is on, so it BYPASSES the
+  // RLS of the tables beneath it — a public view over a tenant table leaks every row.
+  // A materialized view can't enforce RLS at all. Warn (the actual reach depends on a
+  // GRANT a static scan can't see), unless the view opts into security_invoker.
+  const reView = new RegExp(`create\\s+(?:or\\s+replace\\s+)?(materialized\\s+)?view\\s+(?:if\\s+not\\s+exists\\s+)?(${IDENT})([\\s\\S]*?)\\bas\\b`, 'gi')
+  while ((m = reView.exec(text))) {
+    const t = keyOf(m[2])
+    if (t.schema !== 'public') continue // only the client-reachable schema
+    const isMat = !!m[1]
+    const invoker = /security_invoker\s*=\s*(?:on|true|1)/i.test(m[3] || '')
+    if (isMat || !invoker) {
+      findings.push({ rule: 'view_bypasses_rls', severity: 'warn', file, line: lineAt(m.index), object: t.display,
+        detail: isMat
+          ? `materialized view ${t.display} runs as its owner and cannot enforce RLS — if a client role can read it, it exposes every underlying row. Keep it out of a client-reachable schema, or restrict the grant.`
+          : `view ${t.display} runs with its owner's rights (security_invoker off), so it BYPASSES the RLS of the tables beneath it — a client-reachable view over a tenant table leaks every row. Add WITH (security_invoker = on).` })
+    }
+  }
+
+  // CREATE FUNCTION ... SECURITY DEFINER with no pinned search_path. A definer
+  // function executes as its owner; without `SET search_path`, a caller can shadow an
+  // unqualified reference through their own search_path and run code as the owner
+  // (privilege escalation). Supabase's guidance is to pin `SET search_path = ''`.
+  const reDefiner = /create\s+(?:or\s+replace\s+)?function\s+([^;]*?)\bas\b\s*(?:\$[A-Za-z0-9_]*\$|')/gi
+  while ((m = reDefiner.exec(text))) {
+    const header = m[1]
+    if (!/\bsecurity\s+definer\b/i.test(header)) continue
+    if (/\bset\s+"?search_path"?\b/i.test(header)) continue // pinned → safe
+    const nm = /^\s*("?[\w]+"?(?:\.[\w".]+)?)\s*\(/.exec(header)
+    const fn = nm ? unquote(nm[1].split('.').pop()) : 'function'
+    findings.push({ rule: 'definer_no_search_path', severity: 'warn', file, line: lineAt(m.index), object: fn,
+      detail: `SECURITY DEFINER function ${fn}() has no pinned search_path — it runs as its owner, so a caller can hijack an unqualified name via their own search_path and execute code as the owner. Add SET search_path = ''.` })
+  }
+
   events.sort((a, b) => a.index - b.index)
   return { events, droppedPolicies, recreatedPolicies, droppedTriggers, recreatedTriggers, findings }
 }

@@ -349,3 +349,26 @@ test('allow-list silences a finding by table name', async () => {
   assert.equal(r.passed, true)
   assert.ok(r.allowed.length >= 4)
 })
+
+// NEW COVERAGE (was declared "not covered yet"): a view/matview in `public` runs
+// with the owner's rights and bypasses the RLS of its underlying tables.
+test('#view a public view without security_invoker is flagged (RLS bypass)', () => {
+  const rules = sql => scanSql(sql, 'm.sql').findings.map(f => f.rule)
+  assert.ok(rules('create view public.all_notes as select * from notes;').includes('view_bypasses_rls'))
+  assert.ok(rules('create materialized view public.mv as select * from tenants;').includes('view_bypasses_rls'))
+  // opts into security_invoker → safe; a non-public (server-only) schema → not client-reachable
+  assert.ok(!rules('create view public.v with (security_invoker = on) as select * from notes;').includes('view_bypasses_rls'))
+  assert.ok(!rules('create view internal.v as select * from notes;').includes('view_bypasses_rls'))
+})
+
+// NEW COVERAGE: a SECURITY DEFINER function with no pinned search_path can be
+// hijacked into running as its owner. Supabase's guidance is SET search_path = ''.
+test('#definer a SECURITY DEFINER function without a pinned search_path is flagged', () => {
+  const rules = sql => scanSql(sql, 'm.sql').findings.map(f => f.rule)
+  assert.ok(rules('create function public.f() returns int language sql security definer as $$ select 1 $$;').includes('definer_no_search_path'))
+  assert.ok(rules('create or replace function g() returns trigger security definer language plpgsql as $$ begin return new; end $$;').includes('definer_no_search_path'))
+  // pinned search_path (either order) → safe; a plain (invoker) function → not flagged
+  assert.ok(!rules("create function f() returns int language sql security definer set search_path = '' as $$ select 1 $$;").includes('definer_no_search_path'))
+  assert.ok(!rules("create function f() returns trigger language plpgsql set search_path='' security definer as $$ begin return new; end $$;").includes('definer_no_search_path'))
+  assert.ok(!rules('create function f() returns int language sql as $$ select 1 $$;').includes('definer_no_search_path'))
+})

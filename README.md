@@ -21,6 +21,8 @@ npx airlock-migrate ./db/migrations
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
 | `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` |
 | `permissive_true` | fail | `CREATE POLICY ... USING (true)` / `WITH CHECK (true)` |
+| `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
+| `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
 | `drop_policy` | warn | a policy dropped and never re-created |
 | `drop_trigger` | warn | a trigger dropped and never re-created (how signup logic silently goes missing) |
 
@@ -40,9 +42,6 @@ Migration Guard focuses on the RLS / table failure mode. These vectors can also
 leak and are **not** flagged yet — review them yourself (or keep the Airlock
 Monitor watching production):
 
-- **Views / materialized views** over a protected table — a view runs with its
-  owner's rights and bypasses RLS unless created `with (security_invoker = on)`.
-- **`SECURITY DEFINER` functions** — they run as the definer and can sidestep RLS.
 - **Non-literal permissive predicates** — a policy is flagged on the literal
   `USING (true)` / `WITH CHECK (true)`. A tautology written another way
   (`USING (1 = 1)`, `USING (owner_id = owner_id)`) is *not* caught here — for
