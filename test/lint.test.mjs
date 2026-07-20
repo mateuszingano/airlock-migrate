@@ -1057,3 +1057,12 @@ test('#tautology BETWEEN SYMMETRIC normalizes its bounds', () => {
   assert.ok(usingPred('1 between symmetric 2 and 0'))
   assert.ok(!usingPred('created_at between symmetric start_at and end_at'))
 })
+
+test('#tautology a scalar subquery hugging its paren is still reduced', () => {
+  // `select(true)` is valid Postgres; requiring a space let `(select(true))`
+  // slip — the same corner already closed for not/and/or.
+  assert.ok(usingPred('(select(true))'))
+  assert.ok(usingPred('(select(1=1))'))
+  // and the keyword boundary still refuses a column that merely starts with it
+  assert.ok(!usingPred('selected_at is null'))
+})

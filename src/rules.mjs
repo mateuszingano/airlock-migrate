@@ -555,7 +555,10 @@ function constValue(pred) {
   const CONST = /^(?:-?\d+(?:\.\d+)?|'[^']*')$/
   // A scalar subquery with no source (`(select true)`) is just its expression.
   // Anything reading a table stays unknown — that is a real scope, not a constant.
-  const scalar = /^select (.+)$/.exec(s)
+  // `\b` after the keyword, not a required space: `select(true)` is valid
+  // Postgres and hugs the paren, the same "a space must not decide the verdict"
+  // corner already closed for `not`/`and`/`or`. `\b` still refuses `selectfoo`.
+  const scalar = /^select\b\s*(.+)$/.exec(s)
   if (scalar && !/\b(from|where|join)\b/.test(scalar[1])) return constValue(scalar[1])
   // `coalesce(true, x)` returns its first non-null argument.
   const coal = /^coalesce\s*\((.+)\)$/.exec(s)
