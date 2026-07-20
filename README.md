@@ -22,7 +22,7 @@ npx airlock-migrate ./db/migrations
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
 | `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`, including the `IF EXISTS` and descendant-`*` spellings |
 | `permissive_true` | fail | a policy predicate that reduces to always-true, reachable by a client role — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0`, the boolean forms `NOT false`, `true AND true`, `null IS null`, `true IS true`, `1 IS DISTINCT FROM 2`, `1 BETWEEN 0 AND 2`, `coalesce(true,false)`, `CASE WHEN true THEN true END`, `true::boolean`, `(select true)`. Operators are matched by token, so `(1=1)or(x)` counts even without spaces. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
-| `dynamic_ddl_unanalyzed` | fail / warn | `EXECUTE` of SQL assembled at runtime (`format()`, `\|\|` concatenation, a variable) inside a `DO` block or function body. This gate reads SQL *text*, so it cannot resolve what such a statement targets — it says so instead of reporting the file as clean. **fail** when a fragment mentions row level security or a policy, **warn** for any other dynamic DDL |
+| `dynamic_ddl_unanalyzed` | fail / warn | `EXECUTE` of SQL assembled at runtime (`format()`, `\|\|` concatenation, a variable) inside a `DO` block or function body. This gate reads SQL *text*, so it cannot resolve what such a statement targets — it says so instead of reporting the file as clean. **fail** by default (a placeholder defeats any keyword test), stepping down to **warn** only when the statement reads as index/maintenance work (`create/drop index`, `reindex`, `analyze`, `vacuum`, `refresh materialized view`, `comment on`) with no RLS/policy mention |
 | `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
 | `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
 | `drop_policy` | warn | a policy dropped and never re-created |
@@ -112,6 +112,14 @@ Monitor watching production):
   index/maintenance work. If your migrations build DDL dynamically on purpose,
   expect to waive it deliberately with `--allow rule:dynamic_ddl_unanalyzed` —
   and know that doing so waives *every* dynamic statement in the run.
+- **A function whose header is padded with comments on *both* sides.** A
+  `CREATE FUNCTION` body is analyzed when a comment or long whitespace sits
+  between `AS` and `$$`, *or* between `create` and `function` — either one alone
+  is handled. The one shape that still slips needs **both** at once (~55+ chars
+  wedged between `create` and `function` **and** ~22+ between `AS` and `$$`),
+  which pushes the keyword past the header window and the `as` past the tail
+  window simultaneously, so the body is read as data. No honest migration writes
+  it, but it is declared here rather than silently omitted.
 
 What it does **not** do silently: if a file ends *inside* an unterminated
 construct (string, block comment, dollar-quote), everything after the opener is

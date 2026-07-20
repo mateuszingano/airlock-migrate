@@ -64,7 +64,7 @@ Rules:
   unparsable         (fail)   file ends inside an unterminated string/comment/
                               dollar-quote, so the rest of it was never analyzed
   dynamic_ddl_unanalyzed      EXECUTE of SQL assembled at runtime (format(), ||)
-                     (fail)   fail when it mentions RLS or a policy, warn otherwise
+                     (fail)   fail by default; warn only for index/maintenance DDL
   drop_policy        (warn)   a policy dropped and never re-created
   drop_trigger       (warn)   a trigger dropped and never re-created (how signup logic goes missing)
   view_bypasses_rls  (warn)   a view without security_invoker reads past the caller's RLS

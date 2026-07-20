@@ -506,12 +506,15 @@ test('#doblock an executable body is analyzed however the statement is written',
   // A comment or long whitespace between AS and $$ must NOT blank the body. This
   // pushed `as` out of the 24-char tail window, the body was read as data, and a
   // disable_rls inside it shipped green (exit 0) — a false negative in the core.
+  // The padding here is deliberately >24 chars: a shorter comment leaves `as`
+  // inside the tail window, so it would pass even on the buggy version and prove
+  // nothing. These strings were confirmed to FAIL against the pre-fix commit.
   assert.ok(
-    rules(`create function h() returns void language plpgsql as  -- deploy hook\n$$\n${BODY}\n$$;`).includes('disable_rls'),
+    rules(`create function h() returns void language plpgsql as  -- this is a longer deployment hook comment\n$$\n${BODY}\n$$;`).includes('disable_rls'),
     'a comment between AS and $$ must not silence the body',
   )
   assert.ok(
-    rules(`create function h2() returns void as\n\n\n\n\n\n\n\n\n\n$$\n${BODY}\n$$;`).includes('disable_rls'),
+    rules(`create function h2() returns void as${' '.repeat(40)}\n$$\n${BODY}\n$$;`).includes('disable_rls'),
     'long whitespace between AS and $$ must not silence the body either',
   )
   // …and a dollar-quoted STRING is still treated as data (no false positive)
