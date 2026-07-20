@@ -92,13 +92,16 @@ Monitor watching production):
   than silently omitted, so a project with its own schema of the same name can
   see that it was passed over.
 - **Always-true predicates that need real type or catalog knowledge.** The
-  evaluator reduces constants, reflexive equality, `NOT`, `AND`/`OR` (found by
-  token, so `(1=1)or(x)` counts), `IS NULL/TRUE/FALSE`, `IS DISTINCT FROM`,
-  `BETWEEN`, `COALESCE`, a simple `CASE`, casts and a sourceless `(select …)`.
-  It stops where deciding would need to know types or resolve a function: an
-  always-true expression built from operators it does not model
-  (`'x' || '' = 'x'`, `array_length('{}'::int[],1) is null`), or a
-  user-defined function that always returns true (`using (my_always_true())`).
+  evaluator reduces constants, reflexive equality, `NOT`, `AND`/`OR` (all found
+  by token, so `(1=1)or(x)` and `not(1=2)` count without spaces), `IS
+  NULL/TRUE/FALSE`, `IS DISTINCT FROM`, `BETWEEN` (incl. `SYMMETRIC`),
+  `COALESCE`, a simple `CASE`, casts (incl. multi-word types like `double
+  precision`) and a sourceless `(select …)`. It stops where deciding would need
+  to know types or resolve a function: an always-true expression built from
+  operators it does not model (`'x' || '' = 'x'`, `array_length('{}'::int[],1)
+  is null`), a constant-returning built-in it does not special-case (`nullif`,
+  `(values (true))`), or a user-defined function that always returns true
+  (`using (my_always_true())`).
   A predicate it cannot reduce is left alone rather than guessed at — the
   evaluator is deliberately biased against false alarms on real policies.
 - **Dynamic DDL is reported, never resolved.** `dynamic_ddl_unanalyzed` tells you

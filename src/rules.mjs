@@ -444,8 +444,23 @@ function stripCasts(s) {
     if (c === ':' && s[i + 1] === ':') {
       i += 2
       while (i < s.length && /\s/.test(s[i])) i++
-      while (i < s.length && /\w/.test(s[i])) i++ // the type name, and ONLY it —
-      // a `/[\s\w]/` loop here would keep eating and swallow `and x` after the cast
+      while (i < s.length && /\w/.test(s[i])) i++ // the first type word — never more
+      // than the type: a `/[\s\w]/` loop here would eat `and x` after the cast.
+      // A handful of built-in type names are two or three words. Consume a
+      // FOLLOWING word only when it is one of those continuation keywords, so
+      // `1::double precision` reduces but `flag::boolean and x` keeps the `and`.
+      // Missing this left `1::double precision = 1::double precision` looking
+      // like `1 precision = 1 precision` — unreduced, so an always-true cast
+      // comparison shipped green.
+      const CONT = new Set(['precision', 'varying', 'with', 'without', 'time', 'zone'])
+      for (;;) {
+        let j = i
+        while (j < s.length && /\s/.test(s[j])) j++
+        let k = j
+        while (k < s.length && /\w/.test(s[k])) k++
+        if (k > j && CONT.has(s.slice(j, k))) i = k
+        else break
+      }
       if (s[i] === '(') { // a length/precision: `varchar(10)`, `numeric(10,2)`
         let d = 0
         while (i < s.length) { if (s[i] === '(') d++; else if (s[i] === ')') { d--; if (!d) { i++; break } } i++ }
@@ -487,13 +502,23 @@ function constValue(pred) {
   // and `2`, and reads as unknown. Each is anchored to the WHOLE predicate, so
   // a larger expression that merely contains one still falls through to the
   // split below.
-  const between = new RegExp(`^(${OPERAND_RE}) (not )?between (${OPERAND_RE}) and (${OPERAND_RE})$`).exec(s)
+  // `between symmetric lo and hi` normalizes the bounds, so it is true when a is
+  // within [min(lo,hi), max(lo,hi)] regardless of order. Model it by testing
+  // both orientations and OR-ing them.
+  const between = new RegExp(`^(${OPERAND_RE}) (not )?between (symmetric )?(${OPERAND_RE}) and (${OPERAND_RE})$`).exec(s)
   if (between) {
-    const [, a, neg, lo, hi] = between
-    const ge = constValue(`${a} >= ${lo}`)
-    const le = constValue(`${a} <= ${hi}`)
-    if (ge === null || le === null) return null
-    const v = ge && le
+    const [, a, neg, sym, lo, hi] = between
+    const inRange = (x, y) => {
+      const ge = constValue(`${a} >= ${x}`)
+      const le = constValue(`${a} <= ${y}`)
+      return ge === null || le === null ? null : ge && le
+    }
+    let v = inRange(lo, hi)
+    if (sym) {
+      const w = inRange(hi, lo)
+      v = v === null || w === null ? (v === true || w === true ? true : null) : v || w
+    }
+    if (v === null) return null
     return neg ? !v : v
   }
   const kase = /^case when (.+?) then (.+?)(?: else (.+?))? end$/.exec(s)
@@ -516,8 +541,14 @@ function constValue(pred) {
     if (vs.some((v) => v === false)) return false
     return vs.every((v) => v === true) ? true : null
   }
-  if (s.startsWith('not ')) {
-    const inner = constValue(s.slice(4))
+  // `not` is an operator too, so it can hug its operand: `not(false)` is valid
+  // Postgres and always true. Reading only `not ` (with a space) left the same
+  // "a space decides the verdict" hole the token split just closed for
+  // `and`/`or` — `using (not(1=2))` shipped green and opened the table to
+  // everyone. Accept `not` when what follows is a space or an opening paren.
+  const notm = /^not[\s(]/.exec(s)
+  if (notm) {
+    const inner = constValue(s.slice(3))
     return inner === null ? null : !inner
   }
   const OPERAND = "'[^']*'|[\\w.]+"

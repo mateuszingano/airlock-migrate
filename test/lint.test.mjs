@@ -1023,3 +1023,37 @@ test('#tautology a cast does not swallow the rest of the expression', () => {
   assert.ok(!usingPred('flag::boolean and owner_id = auth.uid()'))
   assert.ok(usingPred('true::boolean and true'))
 })
+
+// ---------------------------------------------------------------------------
+// FN-1/FN-2/FN-3 from the 3rd fix-verifier pass — the same "a space decides the
+// verdict" family the token split was supposed to end, left in three corners.
+// ---------------------------------------------------------------------------
+
+test('#tautology NOT hugging its operand is still NOT', () => {
+  // `not(1=2)` is valid Postgres and always true; reading only `not ` (with a
+  // space) let `using (not(1=2))` open the whole table and ship green.
+  for (const pred of ['not(false)', 'not(1=2)', 'not(0=1)', '(not(false))']) {
+    assert.ok(usingPred(pred), `USING (${pred}) is always true`)
+  }
+})
+
+test('#tautology NOT over a column stays unknown whether or not it hugs', () => {
+  for (const pred of ['not(is_private)', 'not (owner_id = auth.uid())', 'not deleted']) {
+    assert.ok(!usingPred(pred), `USING (${pred}) depends on the row`)
+  }
+})
+
+test('#tautology a multi-word type name does not break a constant cast', () => {
+  // `1::double precision = 1::double precision` read as `1 precision = 1
+  // precision` and slipped through — the cast stripper ate only one type word.
+  assert.ok(usingPred('1::double precision = 1::double precision'))
+  assert.ok(usingPred("'a'::character varying = 'a'::character varying"))
+  // and it still must not eat past the type into the rest of the expression
+  assert.ok(!usingPred('id::double precision = amount'))
+  assert.ok(!usingPred('flag::boolean and owner_id = auth.uid()'))
+})
+
+test('#tautology BETWEEN SYMMETRIC normalizes its bounds', () => {
+  assert.ok(usingPred('1 between symmetric 2 and 0'))
+  assert.ok(!usingPred('created_at between symmetric start_at and end_at'))
+})
