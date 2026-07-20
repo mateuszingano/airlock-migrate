@@ -771,3 +771,118 @@ test('#allow unparsable is only waivable by its rule, never by a path segment', 
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// Regressions from the 20/07 audit. Each of the five below shipped GREEN, exit
+// 0, on code whose whole job was to catch it.
+// ---------------------------------------------------------------------------
+
+test('#altertable IF EXISTS does not hide a DISABLE ROW LEVEL SECURITY', () => {
+  const { findings } = scanSql('alter table if exists public.users disable row level security;', 'm.sql')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].rule, 'disable_rls')
+  assert.equal(findings[0].object, 'public.users')
+})
+
+test('#altertable the descendant "*" does not hide a DISABLE either', () => {
+  const { findings } = scanSql('alter table only public.users * disable row level security;', 'm.sql')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].rule, 'disable_rls')
+})
+
+test('#altertable IF EXISTS / "*" are also read on the ENABLE side', () => {
+  // Otherwise the fix above would turn into a false positive: the CREATE stays
+  // unmatched and reports a table whose RLS is in fact on.
+  const sql =
+    'create table public.foo (id int); alter table if exists only public.foo * enable row level security;'
+  assert.equal(finalizeTables(scanSql(sql, 'm.sql').events).length, 0)
+})
+
+test('#tautology NOT / AND / IS NULL constants are always-true predicates', () => {
+  for (const pred of ['not false', 'true and true', 'null is null', 'not (1 = 2)', "'a' is not null"]) {
+    const sql = `create policy p on public.t for select to anon using (${pred});`
+    const { findings } = scanSql(sql, 'm.sql')
+    assert.ok(
+      findings.some((f) => f.rule === 'permissive_true'),
+      `USING (${pred}) grants every row and must be caught`,
+    )
+  }
+})
+
+test('#tautology a real predicate is still not flagged (no false positives)', () => {
+  for (const pred of [
+    'auth.uid() = user_id',
+    'deleted_at is null',
+    'not is_private',
+    'tenant_id = current_tenant() and auth.uid() = user_id',
+    "role = 'admin' or auth.uid() = user_id",
+    'length(name) >= 5',
+  ]) {
+    const sql = `create policy p on public.t for select to anon using (${pred});`
+    const { findings } = scanSql(sql, 'm.sql')
+    assert.ok(
+      !findings.some((f) => f.rule === 'permissive_true'),
+      `USING (${pred}) depends on the row — flagging it would be a false alarm`,
+    )
+  }
+})
+
+test('#tautology an OR inside a string literal is one operand, not a split', () => {
+  const sql = "create policy p on public.t for select to anon using (name = 'a or b');"
+  const { findings } = scanSql(sql, 'm.sql')
+  assert.ok(!findings.some((f) => f.rule === 'permissive_true'))
+})
+
+test('#dynamic DDL assembled at runtime that touches RLS breaks the build', () => {
+  for (const stmt of [
+    "execute format('alter table %I disable row level security', t);",
+    "execute 'alter table ' || t || ' disable row level security';",
+    "execute format('create policy %I on %I for select using (true)', p, t);",
+  ]) {
+    const { findings } = scanSql(`do $$ begin\n  ${stmt}\nend $$;`, 'm.sql')
+    const f = findings.find((x) => x.rule === 'dynamic_ddl_unanalyzed')
+    assert.ok(f, `dynamic DDL must not be reported as clean: ${stmt}`)
+    assert.equal(f.severity, 'fail')
+  }
+})
+
+test('#dynamic other dynamic DDL warns rather than breaking the build', () => {
+  const sql = "do $$ begin\n  execute format('create index on %I (id)', t);\nend $$;"
+  const { findings } = scanSql(sql, 'm.sql')
+  const f = findings.find((x) => x.rule === 'dynamic_ddl_unanalyzed')
+  assert.ok(f)
+  assert.equal(f.severity, 'warn')
+})
+
+test('#dynamic a plain literal EXECUTE is analyzed, not merely reported as opaque', () => {
+  const { findings } = scanSql(
+    "do $$ begin\n  execute 'alter table public.a disable row level security';\nend $$;",
+    'm.sql',
+  )
+  assert.ok(findings.some((f) => f.rule === 'disable_rls'), 'the literal is still read')
+  assert.ok(
+    !findings.some((f) => f.rule === 'dynamic_ddl_unanalyzed'),
+    'and it is NOT also reported as unreadable',
+  )
+})
+
+test('#dynamic a trigger EXECUTE FUNCTION clause is not dynamic SQL', () => {
+  const sql =
+    "do $$ begin\n  create trigger tg after insert on public.t for each row execute function f();\nend $$;"
+  const { findings } = scanSql(sql, 'm.sql')
+  assert.ok(!findings.some((f) => f.rule === 'dynamic_ddl_unanalyzed'))
+})
+
+test('#allow a schema name is refused — it would waive every table in it', async () => {
+  const dir = await fixtureDir()
+  try {
+    // Every Supabase table lives in `public`, so this token used to match the
+    // schema segment of every qualified object and turn the whole gate green.
+    await assert.rejects(() => lint({ dir, allow: ['public'] }), /is a schema, not an object/)
+    // The precise waiver still works, and only on what it names.
+    const scoped = await lint({ dir, allow: ['public.secrets'] })
+    assert.ok(!scoped.findings.some((f) => f.object === 'public.secrets'))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

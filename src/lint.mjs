@@ -104,15 +104,42 @@ export async function lint({ dir, files, allow = [] } = {}) {
     }
   }
   // Identifier segments of an object string: "p on public.avatars_secrets" →
-  // ['p', 'public', 'avatars_secrets', 'public.avatars_secrets']
+  // ['p', 'avatars_secrets', 'public.avatars_secrets']
+  //
+  // The SCHEMA qualifier is deliberately NOT a segment of its own. It used to
+  // be, and since every Supabase table lives in `public`, `--allow public` was
+  // a second kill switch hiding behind an ordinary-looking word: it matched the
+  // schema segment of every qualified object and turned the whole gate green,
+  // CRITICALs included. A schema-wide waiver now has to be written as a prefix
+  // (`public.*`), which reads like what it does.
   const segmentsOf = (obj) => {
     const words = obj.split(/[^\w.]+/).filter(Boolean)
     const out = new Set()
     for (const w of words) {
       out.add(w)
-      for (const part of w.split('.')) if (part) out.add(part)
+      const parts = w.split('.').filter(Boolean)
+      if (parts.length > 1) out.add(parts[parts.length - 1]) // object name, not its schema
+      else if (parts.length === 1) out.add(parts[0])
     }
     return out
+  }
+  // A bare schema name can no longer match anything, so it would sit in the
+  // allow-list looking like protection-with-an-exception while waiving nothing.
+  // Say so instead of accepting it in silence.
+  const schemasSeen = new Set()
+  for (const f of findings) {
+    for (const w of String(f.object || '').toLowerCase().split(/[^\w.]+/)) {
+      const parts = w.split('.').filter(Boolean)
+      if (parts.length > 1) schemasSeen.add(parts[0])
+    }
+  }
+  for (const token of allowSet) {
+    if (!token.includes('*') && !token.startsWith('rule:') && schemasSeen.has(token)) {
+      throw new Error(
+        `--allow "${token}" is a schema, not an object — every table in it would be waived, which disables the gate for that schema. ` +
+          `Name the object instead (${token}.my_table), or write the schema-wide waiver explicitly as "${token}.*".`
+      )
+    }
   }
   const matches = (token, f, segs) => {
     if (token === `rule:${f.rule}`) return true
@@ -123,7 +150,10 @@ export async function lint({ dir, files, allow = [] } = {}) {
     // `--allow sql`, or any token matching a path segment, silenced the one
     // finding that says the gate did not run. Waiving "I could not look" has to
     // be deliberate: only the explicit `rule:unparsable` form does it.
-    if (f.rule === 'unparsable') return false
+    // `dynamic_ddl_unanalyzed` is the same shape of statement — "I could not
+    // read this" — and also carries a FILE NAME as its object, so it gets the
+    // same protection: waivable only as `rule:dynamic_ddl_unanalyzed`.
+    if (f.rule === 'unparsable' || f.rule === 'dynamic_ddl_unanalyzed') return false
     // `avatars*` is a PREFIX over identifier segments — so it covers
     // `avatars_secrets` but not `user_avatars_private`. Substring semantics here
     // would recreate the very bug this replaced, just behind an opt-in.

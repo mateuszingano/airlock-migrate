@@ -261,6 +261,15 @@ function keyOf(ident) {
 const IDENT = '(?:"[^"]+"|[\\w]+)(?:\\.(?:"[^"]+"|[\\w]+))?'
 const NAME = '"[^"]+"|[\\w]+' // an identifier: a quoted name (may contain spaces) or a bare word
 
+// The full head of `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`. Both the
+// ENABLE and the DISABLE check read from here so the two can never drift: they
+// used to spell the prefix out separately, and neither knew about `IF EXISTS`
+// or the descendant `*`. Either spelling is ordinary Postgres — a generated
+// migration writes `alter table if exists` routinely — so `alter table if
+// exists t disable row level security` tore RLS down and the gate printed "No
+// dangerous migrations", exit 0.
+const ALTER_TABLE = `alter\\s+table\\s+(?:if\\s+exists\\s+)?(?:only\\s+)?(${IDENT})\\s*\\*?`
+
 // key for a policy/trigger, scoped to its table so same-named objects don't collide
 function objKey(name, tableIdent) {
   return `${keyOf(tableIdent).key}::${unquote(name).toLowerCase()}`
@@ -352,14 +361,19 @@ function outerParenWrapsAll(s) {
   return false
 }
 
-// Split a boolean expression on `OR` at paren-depth 0.
-function splitTopOr(s) {
+// Split a boolean expression on ` or ` / ` and ` at paren-depth 0, ignoring any
+// occurrence inside a single-quoted literal (`tenant = 'a or b'` is one operand,
+// not two).
+function splitTopOp(s, op) {
   const parts = []
-  let depth = 0, last = 0
+  let depth = 0, last = 0, inStr = false
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === '(') depth++
-    else if (s[i] === ')') depth--
-    else if (depth === 0 && s.startsWith(' or ', i)) { parts.push(s.slice(last, i)); i += 3; last = i + 1 }
+    const c = s[i]
+    if (inStr) { if (c === "'") inStr = false; continue }
+    if (c === "'") inStr = true
+    else if (c === '(') depth++
+    else if (c === ')') depth--
+    else if (depth === 0 && s.startsWith(op, i)) { parts.push(s.slice(last, i)); i += op.length - 1; last = i + 1 }
   }
   parts.push(s.slice(last))
   return parts.map((p) => p.trim())
@@ -372,19 +386,57 @@ function splitTopOr(s) {
 // or a function — those are real predicates. This closes the `USING(1=1)` gap
 // without the false positives that fuller policy-logic analysis risks.
 function isConstTautology(pred) {
+  return constValue(pred) === true
+}
+
+// Evaluate a predicate to `true`, `false`, or `null` for "depends on the row —
+// don't guess". The three states are what `NOT` and `AND` need: negating an
+// unknown is still unknown, so a plain boolean would have had to call every
+// unrecognized shape false and `not <unknown>` would come out true — a false
+// positive on real predicates. Without this, `using (not false)`,
+// `using (true and true)` and `using (null is null)` were all invisible: each
+// grants every row, and each shipped green.
+function constValue(pred) {
   let s = String(pred).toLowerCase().replace(/\s+/g, ' ').trim()
   while (outerParenWrapsAll(s)) s = s.slice(1, -1).trim()
   if (s === 'true') return true
-  const parts = splitTopOr(s)
-  if (parts.length > 1) return parts.some(isConstTautology)
+  if (s === 'false') return false
+  // OR before AND: `and` binds tighter, so the top level splits on `or` first.
+  const ors = splitTopOp(s, ' or ')
+  if (ors.length > 1) {
+    const vs = ors.map(constValue)
+    if (vs.some((v) => v === true)) return true
+    return vs.every((v) => v === false) ? false : null
+  }
+  const ands = splitTopOp(s, ' and ')
+  if (ands.length > 1) {
+    const vs = ands.map(constValue)
+    if (vs.some((v) => v === false)) return false
+    return vs.every((v) => v === true) ? true : null
+  }
+  if (s.startsWith('not ')) {
+    const inner = constValue(s.slice(4))
+    return inner === null ? null : !inner
+  }
   const OPERAND = "'[^']*'|[\\w.]+"
+  const CONST = /^(?:-?\d+(?:\.\d+)?|'[^']*')$/
+  // `null is null` / `'a' is not null` — decidable only for a literal operand.
+  // `deleted_at is null` is a real predicate and stays unknown.
+  const isnull = new RegExp(`^(${OPERAND})\\s+is\\s+(not\\s+)?null$`).exec(s)
+  if (isnull) {
+    const [, operand, negated] = isnull
+    const lit = operand.trim()
+    const isNull = lit === 'null' ? true : CONST.test(lit) ? false : null
+    if (isNull === null) return null
+    return negated ? !isNull : isNull
+  }
   const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
   if (refl && refl[1] === refl[2]) return true // owner_id = owner_id
   const cmp = new RegExp(`^(-?\\d+(?:\\.\\d+)?|'[^']*')\\s*(=|<>|!=|<=|>=|<|>)\\s*(-?\\d+(?:\\.\\d+)?|'[^']*')$`).exec(s)
   if (cmp) {
     const [, a, op, b] = cmp
     const aStr = a.startsWith("'"), bStr = b.startsWith("'")
-    if (aStr !== bStr) return false // mixed types → don't guess
+    if (aStr !== bStr) return null // mixed types → don't guess
     const va = aStr ? a : parseFloat(a), vb = bStr ? b : parseFloat(b)
     switch (op) {
       case '=': return va === vb
@@ -399,21 +451,20 @@ function isConstTautology(pred) {
   // side stays unevaluated — `email in (select …)` is a real scope, not a tautology)
   const inm = new RegExp(`^(${OPERAND})\\s+in\\s*\\((.+)\\)$`).exec(s)
   if (inm) {
-    const CONST = /^(?:-?\d+(?:\.\d+)?|'[^']*')$/
-    if (!CONST.test(inm[1].trim())) return false
+    if (!CONST.test(inm[1].trim())) return null
     const list = inm[2].split(',').map((x) => x.trim())
     if (list.length && list.every((x) => CONST.test(x))) return list.includes(inm[1].trim())
-    return false
+    return null
   }
   // a non-negative built-in the comparison can't falsify: `length(x) >= 0`
   const nn = /^(?:length|char_length|character_length|octet_length|bit_length|cardinality)\s*\(.*\)\s*(>=|>|<>|!=)\s*(-?\d+(?:\.\d+)?)$/.exec(s)
   if (nn) {
     const n = parseFloat(nn[2])
-    if (nn[1] === '>=') return n <= 0
-    if (nn[1] === '>') return n < 0
-    if (nn[1] === '<>' || nn[1] === '!=') return n < 0
+    if (nn[1] === '>=' && n <= 0) return true
+    if ((nn[1] === '>' || nn[1] === '<>' || nn[1] === '!=') && n < 0) return true
+    return null // `length(x) >= 5` is a real constraint, not a decided falsehood
   }
-  return false
+  return null
 }
 
 // Is either the USING or the WITH CHECK predicate an always-true constant tautology?
@@ -493,6 +544,45 @@ export function scanSql(sql, file) {
     events.push({ type: 'create', key: t.key, display: t.display, schema: t.schema, ifne: !!m[2], file, line: lineAt(m.index), index: m.index })
   }
 
+  // Dynamic DDL — `execute` inside a DO block / function body whose SQL is
+  // ASSEMBLED at runtime (`format(...)`, `||` concatenation, a variable). The
+  // rules above read the statement text literally, so they catch
+  // `execute 'alter table public.a disable row level security'` and miss every
+  // spelling where the dangerous part is built: `format('alter table %I disable
+  // row level security', t)` and `'alter table ' || t || ' disable …'` both tore
+  // RLS down while the gate printed "No dangerous migrations", exit 0. We cannot
+  // resolve the object here — but reporting "I could not read this" is the one
+  // honest answer, and it is the answer a gate owes.
+  const reExecute = /\bexecute\s+/gi
+  while ((m = reExecute.exec(text))) {
+    if (!inAnyRange(strip.executableRanges, m.index)) continue // top-level `execute` is not PL/pgSQL
+    const semi = text.indexOf(';', m.index)
+    const arg = text.slice(m.index + m[0].length, semi === -1 ? text.length : semi).trim()
+    // `execute function f()` / `execute procedure f()` is a TRIGGER clause, not
+    // dynamic SQL.
+    if (/^(function|procedure)\b/i.test(arg)) continue
+    // A single plain literal is fully analyzable, and the rules above already
+    // read it — no gap to report.
+    if (/^'[^']*'$/.test(arg)) continue
+    if (!arg) continue
+    // If any fragment mentions RLS or a policy, we KNOW this touches the thing
+    // the gate exists to protect and merely can't name the object: that breaks
+    // the build. Any other dynamic DDL is a warn — real, but not worth turning
+    // every `execute format('create index …')` into a red build.
+    const touchesRls = /row\s+level\s+security|\bpolicy\b/i.test(arg)
+    const oneLine = arg.replace(/\s+/g, ' ').slice(0, 80)
+    findings.push({
+      rule: 'dynamic_ddl_unanalyzed',
+      severity: touchesRls ? 'fail' : 'warn',
+      file,
+      line: lineAt(m.index),
+      object: file,
+      detail: touchesRls
+        ? `dynamic DDL built at runtime touches RLS/policies and could not be analyzed — the object it targets is not knowable from the text: \`${oneLine}\``
+        : `dynamic DDL built at runtime was not analyzed — if it touches tables or policies, this gate did not see it: \`${oneLine}\``,
+    })
+  }
+
   // SELECT ... INTO <table> — creates a NEW table (like CREATE TABLE AS) that
   // ships with RLS OFF, same failure mode as CREATE TABLE. Works WITH or WITHOUT
   // a FROM clause. It's a SELECT-INTO (not `INSERT INTO`/`MERGE INTO`) only when
@@ -525,7 +615,7 @@ export function scanSql(sql, file) {
   }
 
   // ALTER TABLE ... ENABLE ROW LEVEL SECURITY
-  const reEnable = new RegExp(`alter\\s+table\\s+(?:only\\s+)?(${IDENT})\\s+enable\\s+row\\s+level\\s+security`, 'gi')
+  const reEnable = new RegExp(`${ALTER_TABLE}\\s+enable\\s+row\\s+level\\s+security`, 'gi')
   while ((m = reEnable.exec(text))) events.push({ type: 'enable', key: keyOf(m[1]).key, index: m.index })
 
   // DROP TABLE — resets the table's RLS state, so a later re-create must re-enable
@@ -537,7 +627,7 @@ export function scanSql(sql, file) {
   }
 
   // ALTER TABLE ... DISABLE ROW LEVEL SECURITY → FAIL
-  const reDisable = new RegExp(`alter\\s+table\\s+(?:only\\s+)?(${IDENT})\\s+disable\\s+row\\s+level\\s+security`, 'gi')
+  const reDisable = new RegExp(`${ALTER_TABLE}\\s+disable\\s+row\\s+level\\s+security`, 'gi')
   while ((m = reDisable.exec(text))) {
     const t = keyOf(m[1])
     findings.push({ rule: 'disable_rls', severity: 'fail', file, line: lineAt(m.index), object: t.display, detail: `RLS turned OFF — every row in ${t.display} becomes readable by anyone with the anon key` })

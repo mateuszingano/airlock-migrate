@@ -19,8 +19,9 @@ npx airlock-migrate ./db/migrations
 | Rule | Level | Catches |
 |------|-------|---------|
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
-| `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` |
-| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0` — reachable by a client role. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
+| `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`, including the `IF EXISTS` and descendant-`*` spellings |
+| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0`, and the boolean combinations `NOT false`, `true AND true`, `null IS null` — reachable by a client role. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
+| `dynamic_ddl_unanalyzed` | fail / warn | `EXECUTE` of SQL assembled at runtime (`format()`, `\|\|` concatenation, a variable) inside a `DO` block or function body. This gate reads SQL *text*, so it cannot resolve what such a statement targets — it says so instead of reporting the file as clean. **fail** when a fragment mentions row level security or a policy, **warn** for any other dynamic DDL |
 | `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
 | `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
 | `drop_policy` | warn | a policy dropped and never re-created |
@@ -50,6 +51,13 @@ database. When this run cannot see that `CREATE`, the finding is raised anyway.
 An unprovable role is not a safe role, and staying quiet here would reopen the
 exact hole this rule exists to close. If the policy really is server-only, waive
 it with `--allow rule:permissive_true:<table>`.
+
+The same principle governs the allow-list itself: a token that would silence the
+whole gate is **refused**, not honoured. A bare `*` is rejected, and so is a bare
+schema name — since every Supabase table lives in `public`, `--allow public` was
+a kill switch wearing an ordinary word. Waive an object (`public.avatars`), a
+rule (`rule:drop_trigger`), or, if you really mean the whole schema, say it out
+loud with a prefix (`public.*`).
 
 ## What it does *not* cover yet
 

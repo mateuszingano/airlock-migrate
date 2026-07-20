@@ -77,6 +77,8 @@ export function fixFor(f) {
       return `-- After dropping, confirm another policy still protects ${t},\n-- or recreate the one you meant to replace.`
     case 'drop_trigger':
       return `-- If the trigger is still needed, recreate it in the same migration:\n-- create trigger <name> after insert on ${t}\n--   for each row execute function <fn>();`
+    case 'dynamic_ddl_unanalyzed':
+      return `-- This gate reads SQL text, so DDL assembled at runtime is invisible to it.\n-- Write the statement literally where you can:\n--   alter table public.your_table enable row level security;\n-- If it has to stay dynamic, waive it deliberately:\n--   airlock-migrate --allow rule:dynamic_ddl_unanalyzed`
     default:
       return '-- (no automated fix for this rule)'
   }
