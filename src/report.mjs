@@ -13,8 +13,34 @@ const ORDER = { critical: 0, high: 1, medium: 2, low: 3 }
 const LABEL = { critical: 'CRITICAL', high: 'HIGH', medium: 'MEDIUM', low: 'LOW' }
 const EMOJI = { critical: '🔴', high: '🟠', medium: '🟡', low: '⚪' }
 
-export function levelOf(rule) {
-  return LEVELS[rule] || 'medium'
+/**
+ * The printed level for a finding.
+ *
+ * The severity the ENGINE assigned is the source of truth for how loud this is,
+ * because it is what decides the exit code. `LEVELS` only grades *within* that:
+ * which build-breaker is critical rather than high.
+ *
+ * Before, `LEVELS` was a second, independent map with a `|| 'medium'` default,
+ * so any rule missing from it printed [MEDIUM] — including `unparsable`, which
+ * is a `fail` and DOES break the build. The reader saw a MEDIUM next to a red
+ * exit 1. Deriving from severity means a new rule can never be mislabelled by
+ * omission again: the worst an unlisted rule gets is a correct-but-coarse label.
+ *
+ * @param {string} rule
+ * @param {'fail'|'warn'} [severity]
+ */
+export function levelOf(rule, severity) {
+  const graded = LEVELS[rule]
+  if (severity === 'fail') {
+    // A build-breaker is never below 'high', whatever the table says.
+    return graded === 'critical' ? 'critical' : 'high'
+  }
+  if (severity === 'warn') {
+    // A warn does not break the build, so it must not wear a build-breaking
+    // label — cap it at 'medium'.
+    return graded === 'low' ? 'low' : 'medium'
+  }
+  return graded || 'medium'
 }
 export function levelLabel(level) {
   return LABEL[level] || String(level).toUpperCase()
@@ -23,7 +49,18 @@ export function levelLabel(level) {
 // "policy \"x\" on public.t" | "public.t" → public.t
 function tableOf(object) {
   const m = / on (.+)$/.exec(object || '')
-  return (m ? m[1] : object || 'public.your_table').trim()
+  return requote((m ? m[1] : object || 'public.your_table').trim())
+}
+
+// The suggested fix is SQL the reader is meant to paste and RUN, so an
+// identifier that needed quotes in the migration needs them here too.
+// `alter table public.my other table enable row level security;` is not a fix,
+// it is a syntax error wearing one.
+function requote(qualified) {
+  return qualified
+    .split('.')
+    .map((part) => (/^[a-z_][a-z0-9_]*$/.test(part) ? part : `"${part.replace(/"/g, '""')}"`))
+    .join('.')
 }
 
 /** The exact SQL / steps to seal this finding. */
@@ -47,14 +84,14 @@ export function fixFor(f) {
 
 /** Add { level, fix } to every finding (mutates and returns the result). */
 export function enrich(result) {
-  result.findings = result.findings.map((f) => ({ ...f, level: levelOf(f.rule), fix: fixFor(f) }))
+  result.findings = result.findings.map((f) => ({ ...f, level: levelOf(f.rule, f.severity), fix: fixFor(f) }))
   return result
 }
 
 /** AI-ready markdown — paste into Claude / Cursor to apply the fixes. */
 export function toMarkdown(result) {
-  const fs = [...result.findings].sort((a, b) => (ORDER[levelOf(a.rule)] ?? 9) - (ORDER[levelOf(b.rule)] ?? 9))
-  const counts = fs.reduce((m, f) => ((m[levelOf(f.rule)] = (m[levelOf(f.rule)] || 0) + 1), m), {})
+  const fs = [...result.findings].sort((a, b) => (ORDER[levelOf(a.rule, a.severity)] ?? 9) - (ORDER[levelOf(b.rule, b.severity)] ?? 9))
+  const counts = fs.reduce((m, f) => ((m[levelOf(f.rule, f.severity)] = (m[levelOf(f.rule, f.severity)] || 0) + 1), m), {})
   const tally = ['critical', 'high', 'medium', 'low'].filter((l) => counts[l]).map((l) => `${counts[l]} ${l}`).join(' · ') || 'none'
   const head = result.passed ? '**PASSED** — nothing dangerous found.' : `**FAILED** — ${result.problems} blocking finding(s).`
 
@@ -62,7 +99,7 @@ export function toMarkdown(result) {
   if (!fs.length) return out + '\n_No findings._\n'
   out += '\n## Findings\n'
   for (const f of fs) {
-    const l = levelOf(f.rule)
+    const l = levelOf(f.rule, f.severity)
     out += `\n### ${EMOJI[l]} ${levelLabel(l)} — \`${f.rule}\`\n`
     out += `\`${f.file}:${f.line}\` — ${f.object}\n\n> ${f.detail}\n\n**Fix:**\n\`\`\`sql\n${fixFor(f)}\n\`\`\`\n`
   }

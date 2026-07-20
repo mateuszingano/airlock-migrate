@@ -12,10 +12,24 @@ inputs:
     description: 'Comma-separated tokens to silence (rule:drop_trigger or a table/policy name).'
     required: false
     default: ''
+  fail-on:
+    description: 'What breaks the build: "fail" (default) or "warn". Use "warn" to also gate on drop_policy, drop_trigger, view_bypasses_rls and definer_no_search_path — without it those four can only be printed, never enforced.'
+    required: false
+    default: 'fail'
 runs:
   using: 'composite'
   steps:
+    # Runs the code shipped with THIS action tag, not whatever `latest` resolves to
+    # on the registry. Two reasons: a consumer pinned to a tag gets a reproducible
+    # run, and our own self-test workflow exercises the checkout instead of the
+    # already-published package. migration-guard has zero runtime deps, so there is
+    # nothing to install.
+    #
+    # Every input goes through env. `${{ }}` is substituted textually BEFORE bash
+    # parses the line, so quotes do not protect an input used inline in `run:`.
     - shell: bash
       env:
         MIGRATION_GUARD_ALLOW: ${{ inputs.allow }}
-      run: npx --yes airlock-migrate "${{ inputs.dir }}"
+        MIGRATION_GUARD_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_DIR: ${{ inputs.dir }}
+      run: node "$GITHUB_ACTION_PATH/bin/migration-guard.mjs" "$INPUT_DIR"

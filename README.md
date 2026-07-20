@@ -20,7 +20,7 @@ npx airlock-migrate ./db/migrations
 |------|-------|---------|
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
 | `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` |
-| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0` — reachable by a client role |
+| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0` — reachable by a client role. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
 | `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
 | `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
 | `drop_policy` | warn | a policy dropped and never re-created |
@@ -42,6 +42,15 @@ server roles (`service_role`), or a `RESTRICTIVE` one, isn't flagged either —
 only a permissive policy a client role (`anon` / `authenticated` / `public`) can
 actually reach.
 
+**Where it deliberately over-flags.** "No false alarms by design" is the goal,
+not a guarantee, and there is one place the design chooses noise on purpose:
+an `ALTER POLICY … USING (true)` with **no `TO` clause** keeps whatever roles the
+policy already had — which may live in an earlier migration or only in the live
+database. When this run cannot see that `CREATE`, the finding is raised anyway.
+An unprovable role is not a safe role, and staying quiet here would reopen the
+exact hole this rule exists to close. If the policy really is server-only, waive
+it with `--allow rule:permissive_true:<table>`.
+
 ## What it does *not* cover yet
 
 Migration Guard focuses on the RLS / table failure mode. These vectors can also
@@ -58,6 +67,25 @@ Monitor watching production):
   whether that role is client-reachable can't be decided from the SQL alone.
 - **Grants to `anon` / `service_role`** — intentionally *not* flagged (RLS is the
   gate; flagging them buries you in noise on a normal Supabase schema).
+- **Destructive DDL — the whole category.** `DROP TABLE`, `DROP COLUMN`,
+  `TRUNCATE`, `DELETE`/`UPDATE` without `WHERE`, `RENAME`, type narrowing,
+  `DROP INDEX`/`DROP CONSTRAINT`, and `CREATE INDEX` without `CONCURRENTLY` all
+  pass clean today. Migration Guard targets the RLS/auth failure mode, not data
+  loss. If you want a gate on destructive changes, this is not it — yet.
+- **Roles beyond the known client set** — `anon`, `authenticated`, `public`,
+  `web_anon` and `web_user` are treated as client-reachable (matched as whole
+  role segments, so `anon_users` is not swept in). A policy scoped only to some
+  other custom role is not flagged, because whether it is client-reachable
+  cannot be decided from the SQL alone.
+- **Tables in a system schema** (`auth`, `cron`, `vault`, …) are not analyzed —
+  they are not yours to police. That skip is now *reported* as a warning rather
+  than silently omitted, so a project with its own schema of the same name can
+  see that it was passed over.
+
+What it does **not** do silently: if a file ends *inside* an unterminated
+construct (string, block comment, dollar-quote), everything after the opener is
+unreadable — so the file is reported as `unparsable` and **fails** the gate. It
+is never reported as clean.
 
 What it now covers that the docs used to omit: **`UNLOGGED` and `FOREIGN` tables**
 are scanned for missing RLS just like ordinary tables (`TEMP` tables are session-

@@ -41,7 +41,13 @@ Arguments:
 Options:
   --allow <tokens>   Comma-separated names to silence. A token matches a rule
                      (rule:drop_trigger) or any finding whose object contains it
-                     (a table/policy name). Also read from $MIGRATION_GUARD_ALLOW.
+                     (a whole table/policy name; "name*" for a prefix). Also read
+                     from $MIGRATION_GUARD_ALLOW. A bare "*" is refused - it
+                     would disable the gate. "unparsable" is waivable only as
+                     rule:unparsable, never by a file-name segment.
+  --fail-on <level>  What breaks the build: "fail" (default) or "warn". With
+                     "warn", the four warn-level rules below can gate too —
+                     without it they can only ever be printed, never enforced.
   --json             Print the result as JSON (includes level + fix per finding).
   --format <fmt>     text (default) or markdown (AI-ready, with fixes to paste).
   --token <t>        Send this run to your Airlock account (history, alerts, team
@@ -51,10 +57,15 @@ Options:
 
 Rules:
   create_table_no_rls (fail)  table created without ENABLE ROW LEVEL SECURITY
+                              (warn outside "public" — not API-reachable by default)
   disable_rls        (fail)   ALTER TABLE ... DISABLE ROW LEVEL SECURITY
-  permissive_true    (fail)   CREATE POLICY ... USING (true) / WITH CHECK (true)
+  permissive_true    (fail)   CREATE or ALTER POLICY ... USING (true) / WITH CHECK (true)
+  unparsable         (fail)   file ends inside an unterminated string/comment/
+                              dollar-quote, so the rest of it was never analyzed
   drop_policy        (warn)   a policy dropped and never re-created
   drop_trigger       (warn)   a trigger dropped and never re-created (how signup logic goes missing)
+  view_bypasses_rls  (warn)   a view without security_invoker reads past the caller's RLS
+  definer_no_search_path (warn) SECURITY DEFINER function without a pinned search_path
 
 Exit codes: 0 = passed, 1 = dangerous change found, 2 = usage error.`
 
@@ -65,7 +76,9 @@ function splitList(v) {
 class UsageError extends Error {}
 
 function parseArgs(argv) {
-  const opts = { dir: undefined, json: false, format: 'text', allow: [], token: undefined, endpoint: undefined }
+  // failOn stays undefined here so the env var can still win in the resolve step
+  // below; the literal default ("fail") is applied there, in one place only.
+  const opts = { dir: undefined, json: false, format: 'text', allow: [], token: undefined, endpoint: undefined, failOn: undefined }
   const positional = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -75,6 +88,9 @@ function parseArgs(argv) {
     else if (a === '--format') opts.format = argv[++i]
     else if (a.startsWith('--format=')) opts.format = a.slice('--format='.length)
     else if (a === '--markdown' || a === '--md') opts.format = 'markdown'
+    else if (a === '--fail-on') opts.failOn = argv[++i]
+    else if (a.startsWith('--fail-on=')) opts.failOn = a.slice('--fail-on='.length)
+    else if (a === '--strict') opts.failOn = 'warn' // convenience alias
     else if (a === '--allow') opts.allow = splitList(argv[++i])
     else if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
     else if (a === '--token') opts.token = argv[++i]
@@ -85,6 +101,10 @@ function parseArgs(argv) {
     else positional.push(a)
   }
   opts.dir = positional[0] || DEFAULT_DIR
+  opts.failOn = (opts.failOn || process.env.MIGRATION_GUARD_FAIL_ON || 'fail').toLowerCase()
+  if (opts.failOn !== 'fail' && opts.failOn !== 'warn') {
+    throw new UsageError(`Invalid --fail-on "${opts.failOn}". Use "fail" (default) or "warn".`)
+  }
   opts.allow = [...splitList(process.env.MIGRATION_GUARD_ALLOW), ...opts.allow]
   opts.token = opts.token || process.env.AIRLOCK_TOKEN
   opts.endpoint = opts.endpoint || process.env.AIRLOCK_ENDPOINT
@@ -126,11 +146,17 @@ function report(r, dir) {
     console.log(`${DIM}ℹ ${r.allowed.length} finding(s) allowed by config.${RESET}`)
   }
 
-  if (r.passed) {
+  if (r.gatePassed) {
     const tail = warns.length ? ` ${DIM}(${warns.length} warning(s))${RESET}` : ''
     console.log(`\n${GREEN}Migration check passed.${RESET}${tail} ${DIM}(${r.files} file(s) scanned)${RESET}`)
+    // Say it out loud when warnings exist but can't gate — otherwise a reader
+    // assumes "passed" means "nothing worth acting on".
+    if (warns.length) {
+      console.log(`${DIM}  ${warns.length} warning(s) did not fail the build. Use --fail-on warn to gate on them.${RESET}`)
+    }
   } else {
-    console.log(`\n${RED}Migration check failed: ${r.problems} dangerous change(s).${RESET}`)
+    const what = r.problems ? `${r.problems} dangerous change(s)` : `${warns.length} warning(s) with --fail-on warn`
+    console.log(`\n${RED}Migration check failed: ${what}.${RESET}`)
   }
 }
 
@@ -153,6 +179,10 @@ async function main() {
     return 2
   }
 
+  // `passed` is the rule-level verdict (no fail-severity findings). `gatePassed`
+  // is the build verdict, which --fail-on can widen to include warnings.
+  r.gatePassed = opts.failOn === 'warn' ? r.problems === 0 && r.warnings === 0 : r.passed
+
   if (opts.json) console.log(JSON.stringify(r, null, 2))
   else if (opts.format === 'markdown') console.log(toMarkdown(r))
   else report(r, opts.dir)
@@ -166,7 +196,7 @@ async function main() {
     }
   }
 
-  return r.passed ? 0 : 1
+  return r.gatePassed ? 0 : 1
 }
 
 main()

@@ -387,3 +387,387 @@ test('#tautology a constant/reflexive always-true predicate is flagged; real pre
   assert.ok(!scanSql('create policy p on public.t as restrictive for select to anon using (1=1);', 'm.sql').findings.some(f => f.rule === 'permissive_true'))
   assert.ok(!scanSql('create policy p on public.t for select to service_role using (1=1);', 'm.sql').findings.some(f => f.rule === 'permissive_true'))
 })
+
+// ONDA 0 — the "green because unreadable" invariant. An unterminated string /
+// block comment / dollar-quote blanks everything after it, so real DDL further
+// down vanished and the gate went GREEN: the more broken the file, the greener
+// the CI. A gate must never approve text it could not read.
+test('#unparsable an unterminated construct fails instead of silently swallowing the rest', () => {
+  const DDL = 'create table public.victim (id int);\nalter table public.other disable row level security;'
+  const rules = (sql) => scanSql(sql, 'm.sql').findings
+  // control: the DDL is caught when nothing hides it
+  assert.ok(rules(DDL).some(f => f.rule === 'disable_rls'), 'control: disable_rls must be caught')
+  // each opener used to swallow the DDL below it — now each is a hard fail
+  for (const prefix of ['select $doc$ this never closes\n', "insert into t values ('oops\n", '/* never closed\n', 'select $1$ x\n']) {
+    const found = rules(prefix + DDL)
+    assert.ok(found.some(f => f.rule === 'unparsable' && f.severity === 'fail'), `expected unparsable fail for: ${prefix.trim()}`)
+  }
+  // and a well-formed file must NOT be flagged (no false positive on the happy path)
+  for (const ok of [DDL, "select $doc$ closed $doc$;\n" + DDL, "insert into t values ('fine');\n" + DDL, '/* closed */\n' + DDL])
+    assert.ok(!rules(ok).some(f => f.rule === 'unparsable'), 'well-formed SQL must not be flagged unparsable')
+})
+
+// The existing perf test only exercised `create table`, which was always linear.
+// The three shapes that actually hung CI were never measured: a 628KB migration
+// took 18.4s, and ~1MB of DO blocks took over two minutes. Causes were a slice
+// to end-of-file per match, two regexes scanning to EOF for an anchor that lives
+// in the same statement, a linear range lookup per match, and a lookback regex
+// run against the entire accumulated output.
+test('#perf the shapes that used to hang CI stay linear', () => {
+  const shapes = {
+    'view without AS': (n) => Array.from({ length: n }, (_, i) => `create view v${i} `).join('\n'),
+    'view complete': (n) => Array.from({ length: n }, (_, i) => `create view v${i} as select * from t${i};`).join('\n'),
+    'DO blocks + select into': (n) => Array.from({ length: n }, (_, i) => `do $$ begin end $$;\nselect x into t${i} from y;`).join('\n'),
+    'trigger without ON': (n) => Array.from({ length: n }, (_, i) => `create trigger tg${i} `).join('\n'),
+    'table + enable rls': (n) => Array.from({ length: n }, (_, i) => `create table public.t${i} (id int);\nalter table public.t${i} enable row level security;`).join('\n'),
+  }
+  for (const [name, gen] of Object.entries(shapes)) {
+    const t0 = Date.now()
+    scanSql(gen(20000), 'm.sql')
+    const ms = Date.now() - t0
+    // Generous ceiling: the point is to catch a return to quadratic (which put
+    // these in the tens of seconds to minutes), not to police small regressions.
+    assert.ok(ms < 5000, `${name} took ${ms}ms for 20k statements — quadratic behaviour is back`)
+  }
+})
+
+// `\b(anon)\b` does NOT match `web_anon` — `_` is a word character — so every
+// policy written with the role name from the official PostgREST tutorial was
+// judged unreachable by a client and passed clean, including FOR ALL USING(true).
+test('#roles client-reachable roles are matched as whole segments', () => {
+  const flagged = (to) => scanSql(`create policy p on public.t for all to ${to} using (true) with check (true);`, 'm.sql')
+    .findings.some((f) => f.rule === 'permissive_true')
+  for (const r of ['anon', 'authenticated', 'public', 'web_anon', 'web_user', '"web_anon"', 'WEB_ANON', 'anon, service_role'])
+    assert.ok(flagged(r), `TO ${r} must be treated as client-reachable`)
+  // and a role that merely CONTAINS one of those words must not be
+  for (const r of ['service_role', 'my_custom_role', 'anon_users', 'postgres', 'authenticator'])
+    assert.ok(!flagged(r), `TO ${r} must NOT be treated as client-reachable`)
+})
+
+// Postgres nests block comments; this parser closed at the first `*/`, so SQL a
+// developer had commented out — with a comment already inside it — came back as
+// live DDL and produced a CRITICAL for a table that does not exist.
+test('#comments nested block comments are one comment, per Postgres rules', () => {
+  const tables = (sql) => {
+    const r = scanSql(sql, 'm.sql')
+    return finalizeTables(r.events).map((f) => f.object)
+  }
+  assert.deepEqual(tables('/* disabled: /* why */ create table public.ghost (id int); */'), [], 'fully commented out → nothing')
+  assert.deepEqual(tables('/* a /* b */ c */ create table public.real (id int);'), ['public.real'], 'DDL after the true close is live')
+  assert.deepEqual(tables('/* plain */ create table public.real2 (id int);'), ['public.real2'], 'ordinary comments still work')
+})
+
+// A create ANYWHERE used to cancel a drop, including one that came first — where
+// the end state is "object removed". That is the exact `on_auth_user_created`
+// shape the README uses as its headline scar.
+test('#order a drop is only cancelled by a create that comes AFTER it', () => {
+  const TRG = 'on_auth_user_created'
+  const create = `create trigger ${TRG} after insert on auth.users for each row execute function handle_new_user();`
+  const drop = `drop trigger ${TRG} on auth.users;`
+  const run = (sql) => {
+    const r = scanSql(sql, 'm.sql')
+    return finalizeDrops([], new Map(), r.droppedTriggers.map((d) => ({ ...d, pos: d.index })), r.recreatedTriggers)
+  }
+  assert.equal(run(`${create}\n${drop}`).length, 1, 'create then drop → ends WITHOUT the trigger → must warn')
+  assert.equal(run(`${drop}\n${create}`).length, 0, 'drop then create → ends WITH the trigger → must stay quiet')
+})
+
+// A table outside `public` is not API-reachable unless the schema is exposed via
+// db-schemas — and "hide internal tables in a private schema" is Supabase's own
+// recommendation. Reporting it CRITICAL broke the build of people who followed
+// the official advice.
+test('#schema a table outside public is a warn, not a blocking CRITICAL', () => {
+  const sev = (sql) => {
+    const r = scanSql(sql, 'm.sql')
+    return finalizeTables(r.events).map((f) => f.severity)
+  }
+  assert.deepEqual(sev('create table public.t (id int);'), ['fail'])
+  assert.deepEqual(sev('create table t (id int);'), ['fail'], 'unqualified means public')
+  assert.deepEqual(sev('create schema private;\ncreate table private.internal_jobs (id int);'), ['warn'])
+})
+
+// `do LANGUAGE plpgsql $$` decided "executable?" from the token next to the
+// opener, saw `plpgsql`, and blanked the whole block — so DDL inside it, up to
+// and including `disable row level security`, vanished and the gate went green.
+// One optional, perfectly valid keyword turned the scanner off.
+test('#doblock an executable body is analyzed however the statement is written', () => {
+  const BODY = "begin\n execute 'alter table public.secrets disable row level security';\n create table public.leaky (id int);\nend"
+  const rules = (sql) => {
+    const r = scanSql(sql, 'm.sql')
+    return [...r.findings, ...finalizeTables(r.events)].map((f) => f.rule)
+  }
+  for (const open of ['do $$', 'do language plpgsql $$', 'DO LANGUAGE PLPGSQL $$']) {
+    const found = rules(`${open}\n${BODY}\n$$;`)
+    assert.ok(found.includes('disable_rls'), `${open} — the body must be analyzed`)
+  }
+  // a function body, LANGUAGE declared before or after AS
+  assert.ok(rules(`create function f() returns void language plpgsql as $$\n${BODY}\n$$;`).includes('disable_rls'))
+  assert.ok(rules('create function g() returns void as $$\n create table public.leaky3 (id int);\n$$ language sql;').includes('create_table_no_rls'))
+  // …and a dollar-quoted STRING is still treated as data (no false positive)
+  assert.deepEqual(rules("select $doc$ create table public.ghost (id int); disable row level security $doc$;"), [])
+  assert.deepEqual(rules('insert into t values ($$ create table public.ghost2 (id int); $$);'), [])
+})
+
+// SYSTEM_SCHEMAS is a fixed list, so a project's own `auth`/`cron` schema — or a
+// real table added to Supabase's — disappeared from the analysis with no trace.
+// Skipping stays right; skipping SILENTLY does not.
+test('#skipped a table in a system schema is reported as skipped, not omitted', () => {
+  const findings = (sql) => scanSql(sql, 'm.sql').findings
+  for (const schema of ['auth', 'cron', 'vault']) {
+    const f = findings(`create table ${schema}.mine (id int);`)
+    assert.ok(f.some((x) => x.rule === 'skipped_system_schema'), `${schema} must be reported as skipped`)
+    assert.ok(f.every((x) => x.severity !== 'fail'), 'and it is a warn, not a build break')
+  }
+  // a schema that merely LOOKS like a system one is analyzed normally
+  assert.deepEqual(findings('create table auth_v2.t (id int);').filter((x) => x.rule === 'skipped_system_schema'), [])
+})
+
+// ── ALTER POLICY (the Critical that survived every earlier audit) ──
+//
+// Only `create policy` had a regex, so widening an EXISTING policy — which is
+// what an adjustment migration actually does — was invisible. A complete tenant
+// leak exited 0 under "No dangerous migrations", on the rule the README leads
+// with. These lock the behavior in both directions.
+const perm = (sql) => scanSql(sql, 'm.sql').findings.filter((f) => f.rule === 'permissive_true')
+
+test('#alter ALTER POLICY … USING (true) is a fail, not invisible', () => {
+  const f = perm('alter policy "user reads own rows" on public.payments using (true);')
+  assert.equal(f.length, 1, 'the leak must be caught')
+  assert.equal(f[0].severity, 'fail', 'and it must break the build')
+})
+
+test('#alter an ALTER POLICY tautology is caught like a CREATE one', () => {
+  assert.equal(perm('alter policy p on public.t using (1=1);').length, 1)
+  assert.equal(perm('alter policy p on public.t using (owner_id = owner_id);').length, 1)
+  assert.equal(perm('alter policy p on public.t with check (true);').length, 1)
+})
+
+test('#alter with no TO clause it inherits the roles of the CREATE in the same run', () => {
+  assert.equal(
+    perm(`create policy p on public.orders for select to anon using (auth.uid() = user_id);
+          alter policy p on public.orders using (true);`).length,
+    1,
+    'created for anon, then widened → fail'
+  )
+  assert.equal(
+    perm(`create policy p on public.jobs for select to service_role using (auth.uid() = user_id);
+          alter policy p on public.jobs using (true);`).length,
+    0,
+    'a service_role-only policy is not client-reachable, widened or not'
+  )
+})
+
+test('#alter its own TO clause wins over the inherited one', () => {
+  assert.equal(perm('alter policy p on public.t to service_role using (true);').length, 0)
+  assert.equal(perm('alter policy p on public.t to anon using (true);').length, 1)
+})
+
+test('#alter legitimate ALTER POLICY statements stay silent (no false alarms)', () => {
+  assert.equal(perm('alter policy p on public.t using (auth.uid() = user_id);').length, 0)
+  assert.equal(perm('alter policy p on public.t using (owner = auth.uid()) with check (owner = auth.uid());').length, 0)
+  assert.equal(perm('alter policy p on public.t rename to p_new;').length, 0)
+})
+
+// ── one producer of "this body is executable" ──
+//
+// There used to be two: stripComments decided from the statement head (so it
+// accepted `do$$`), and a separate executableBodyRanges regex required
+// `do\s+$$`. With no space the body was kept as code but not marked executable,
+// so a PL/pgSQL `SELECT … INTO v` inside it read as a table creation — a
+// blocking CRITICAL decided by one character. The second producer is gone; this
+// pins the property that made the divergence possible.
+test('#exec whitespace before the dollar tag does not change the verdict', () => {
+  for (const kw of ['do', 'as']) {
+    const spaced = {}, tight = {}
+    stripComments(`${kw} $$ body $$`, spaced)
+    stripComments(`${kw}$$ body $$`, tight)
+    assert.equal(spaced.executableRanges.length, 1, `${kw} $$ is executable`)
+    assert.equal(tight.executableRanges.length, 1, `${kw}$$ is executable too`)
+  }
+})
+
+test('#exec a data dollar-string is still NOT an executable range', () => {
+  const st = {}
+  stripComments("select $doc$ create table public.x (id int); $doc$;", st)
+  assert.equal(st.executableRanges.length, 0, 'documentation text is data, not DDL')
+})
+
+test('#exec an unterminated executable body stays executable to EOF', () => {
+  const st = {}
+  stripComments('do $$\nbegin\n  select 1 into v from t;', st)
+  assert.equal(st.executableRanges.length, 1)
+  assert.ok(st.unterminated, 'and it is still reported as unterminated')
+})
+
+// ── quoted identifiers ──
+//
+// IDENT used to be `"?[\w]+"?`, so a quoted name stopped at the first
+// non-word character: `create table "my table"` was recorded as `public.my`,
+// the matching ALTER never lined up with it, and the run failed with a
+// CRITICAL on a table whose RLS was in fact enabled. Two names sharing a first
+// word also collapsed onto one key, so a real miss could be silenced.
+const tableFindings = (sql) => {
+  const { findings, events } = scanSql(sql, 'm.sql')
+  return [...findings, ...finalizeTables(events || [])]
+}
+
+test('#quoted a quoted table name is not truncated at the space', () => {
+  const f = tableFindings(`create table "my table" (id int);
+                           alter table "my table" enable row level security;`)
+  assert.deepEqual(f.filter((x) => x.rule === 'create_table_no_rls'), [], 'RLS IS enabled — no false alarm')
+})
+
+test('#quoted two quoted names sharing a first word do not collide', () => {
+  const f = tableFindings(`create table "my table" (id int);
+                           alter table "my table" enable row level security;
+                           create table "my other table" (id int);`)
+  const missed = f.filter((x) => x.rule === 'create_table_no_rls')
+  assert.equal(missed.length, 1, 'the second table is genuinely missing RLS')
+  assert.match(missed[0].object, /my other table/)
+})
+
+test('#quoted the suggested fix is runnable SQL, not a syntax error', () => {
+  assert.match(
+    fixFor({ rule: 'create_table_no_rls', object: 'public.my other table' }),
+    /alter table public\."my other table" enable row level security;/,
+  )
+})
+
+test('#quoted a dot inside a quoted name is part of the name, not a qualifier', () => {
+  const f = tableFindings('create table "my.table" (id int);')
+  const missed = f.filter((x) => x.rule === 'create_table_no_rls')
+  assert.equal(missed.length, 1)
+  assert.equal(missed[0].object, 'public.my.table', 'schema stays public; the dot is in the name')
+})
+
+// ── the printed label must agree with the exit code ──
+//
+// LEVELS was a second, independent map with a `|| 'medium'` default, so a rule
+// missing from it printed [MEDIUM] regardless of what it did. `unparsable` is a
+// `fail` — it breaks the build — and printed MEDIUM next to a red exit 1. The
+// label now derives from the severity the engine assigned, so omission can only
+// make a label coarse, never wrong.
+test('#label no fail is ever printed below HIGH, and no warn above MEDIUM', () => {
+  const rules = [
+    'create_table_no_rls', 'disable_rls', 'permissive_true', 'drop_policy',
+    'drop_trigger', 'unparsable', 'view_bypasses_rls', 'definer_no_search_path',
+    'skipped_system_schema', 'a_rule_added_next_year',
+  ]
+  for (const rule of rules) {
+    assert.ok(
+      ['critical', 'high'].includes(levelOf(rule, 'fail')),
+      `${rule}: a build-breaking finding must not print below HIGH`,
+    )
+    assert.ok(
+      ['medium', 'low'].includes(levelOf(rule, 'warn')),
+      `${rule}: a non-blocking finding must not print above MEDIUM`,
+    )
+  }
+})
+
+test('#label unparsable — the rule that was mislabelled — prints as a build-breaker', () => {
+  assert.equal(levelOf('unparsable', 'fail'), 'high')
+  assert.equal(levelOf('create_table_no_rls', 'fail'), 'critical', 'and grading within fail is preserved')
+})
+
+// A fixed 400-chunk lookback window used to decide whether a dollar body was
+// executable. A function header longer than the window — a wide argument list,
+// clauses between AS and the body — pushed the opening keyword out of view, the
+// body was blanked as if it were data, and every rule inside it went quiet with
+// no signal. Anchoring to the statement start removes the cliff entirely.
+test('#window a long function header does not silence its body', () => {
+  for (const gap of [10, 350, 600, 5000]) {
+    const sql = `create function f(a int)\nreturns void\n${'  -- ' + 'x'.repeat(gap) + '\n'}as $$\n  create table public.leak (id int);\n$$ language plpgsql;`
+    const st = {}
+    stripComments(sql, st)
+    assert.equal(st.executableRanges.length, 1, `a ${gap}-char header must not hide the body`)
+  }
+})
+
+test('#window scanning stays linear on DO-heavy input', () => {
+  const sql = Array.from({ length: 20_000 }, (_, i) => `do $$ begin perform ${i}; end $$;`).join('\n')
+  const t0 = Date.now()
+  stripComments(sql, {})
+  const ms = Date.now() - t0
+  // Measured ~45ms locally. A generous ceiling still catches a return to the
+  // quadratic behaviour this replaced, without flaking on a slow CI runner.
+  assert.ok(ms < 4000, `stripComments took ${ms}ms on 20k DO blocks — expected linear time`)
+})
+
+// ── SECURITY DEFINER / SET search_path on either side of the body ──
+//
+// Postgres accepts both clauses before OR after the body, and Supabase's own
+// generator emits them AFTER. Reading only the pre-AS header was wrong in both
+// directions: a trailing SECURITY DEFINER was invisible (false negative), and a
+// trailing SET search_path did not count as pinned, so a correctly-hardened
+// function was warned about (false alarm).
+const definer = (sql) => scanSql(sql, 'm.sql').findings.filter((f) => f.rule === 'definer_no_search_path').length
+
+test('#definer a SECURITY DEFINER declared after the body is caught', () => {
+  assert.equal(definer('create function g() returns void as $$ select 1; $$ language sql security definer;'), 1)
+  assert.equal(definer('create function g() returns void security definer as $$ select 1; $$ language sql;'), 1)
+})
+
+test('#definer a SET search_path declared after the body counts as pinned', () => {
+  assert.equal(
+    definer("create function g() returns void security definer as $$ select 1; $$ language sql set search_path = '';"),
+    0,
+    'a hardened function must not be warned about',
+  )
+  assert.equal(
+    definer("create function g() returns void security definer set search_path = '' as $$ select 1; $$ language sql;"),
+    0,
+  )
+})
+
+test('#definer the clauses are read from the statement, never from the body', () => {
+  assert.equal(
+    definer('create function g() returns void as $$ select 1; -- security definer\n $$ language sql;'),
+    0,
+    'the words inside a body are code/comment, not clauses',
+  )
+  assert.equal(definer('create function g() returns void as $$ select 1; $$ language sql;'), 0)
+})
+
+// ── the allow-list must not become a kill switch ──
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+async function fixtureDir() {
+  const dir = await mkdtemp(join(tmpdir(), 'mg-allow-'))
+  await writeFile(join(dir, 'a.sql'), 'create table public.secrets (id int);\n')
+  await writeFile(join(dir, 'b.sql'), "create policy p on public.t for select to anon using ('unterminated;\n")
+  return dir
+}
+
+test('#allow a bare * is refused instead of silencing the whole gate', async () => {
+  const dir = await fixtureDir()
+  try {
+    await assert.rejects(() => lint({ dir, allow: ['*'] }), /disable the gate entirely/)
+    const clean = await lint({ dir })
+    assert.equal(clean.passed, false, 'and without it the findings are still there')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('#allow unparsable is only waivable by its rule, never by a path segment', async () => {
+  const dir = await fixtureDir()
+  try {
+    // Every migration file name ends in "sql", so an object-segment match on it
+    // silenced the finding that says "this file was never checked".
+    const bySegment = await lint({ dir, allow: ['sql'] })
+    assert.ok(
+      bySegment.findings.some((f) => f.rule === 'unparsable'),
+      '--allow sql must not waive "I could not read this file"',
+    )
+    const byRule = await lint({ dir, allow: ['rule:unparsable'] })
+    assert.ok(
+      !byRule.findings.some((f) => f.rule === 'unparsable'),
+      'the explicit, deliberate form still works',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
