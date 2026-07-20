@@ -361,22 +361,101 @@ function outerParenWrapsAll(s) {
   return false
 }
 
-// Split a boolean expression on ` or ` / ` and ` at paren-depth 0, ignoring any
-// occurrence inside a single-quoted literal (`tenant = 'a or b'` is one operand,
-// not two).
+// Split a boolean expression on the keyword `or` / `and` at paren-depth 0.
+//
+// The operator is found by TOKEN BOUNDARY, not by surrounding spaces. Matching
+// ` or ` meant `(1=1)or(user_id = auth.uid())` — which Postgres accepts and
+// which grants every row — was never split, so it read as one unrecognizable
+// operand and passed clean. The boundary test is what keeps `order_id` and
+// `nordic` from being mistaken for the keyword.
+//
+// Single-quoted literals are skipped whole (including the `''` escape), so
+// `tenant = 'it''s or mine'` stays one operand.
 function splitTopOp(s, op) {
   const parts = []
-  let depth = 0, last = 0, inStr = false
+  let depth = 0, last = 0
   for (let i = 0; i < s.length; i++) {
     const c = s[i]
-    if (inStr) { if (c === "'") inStr = false; continue }
-    if (c === "'") inStr = true
-    else if (c === '(') depth++
-    else if (c === ')') depth--
-    else if (depth === 0 && s.startsWith(op, i)) { parts.push(s.slice(last, i)); i += op.length - 1; last = i + 1 }
+    if (c === "'") {
+      i++
+      while (i < s.length) {
+        if (s[i] === "'") {
+          if (s[i + 1] === "'") i++ // an escaped quote, still inside the literal
+          else break
+        }
+        i++
+      }
+      continue
+    }
+    if (c === '(') { depth++; continue }
+    if (c === ')') { depth--; continue }
+    if (depth !== 0 || !s.startsWith(op, i)) continue
+    const before = i === 0 ? '' : s[i - 1]
+    const after = s[i + op.length] ?? ''
+    if (/[\w$]/.test(before) || /[\w$]/.test(after)) continue // `order_id`, `xor`
+    parts.push(s.slice(last, i))
+    i += op.length - 1
+    last = i + 1
   }
   parts.push(s.slice(last))
   return parts.map((p) => p.trim())
+}
+
+// Split a comma-separated argument list at paren-depth 0 (`coalesce(a, f(b,c))`).
+function splitArgs(s) {
+  const parts = []
+  let depth = 0, last = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c === "'") {
+      i++
+      while (i < s.length) {
+        if (s[i] === "'") { if (s[i + 1] === "'") i++; else break }
+        i++
+      }
+      continue
+    }
+    if (c === '(') depth++
+    else if (c === ')') depth--
+    else if (c === ',' && depth === 0) { parts.push(s.slice(last, i)); last = i + 1 }
+  }
+  parts.push(s.slice(last))
+  return parts.map((p) => p.trim())
+}
+
+// Drop `::type` casts that sit outside string literals, so `true::boolean` and
+// `1::int = 1::int` reduce like the values they are. Casts inside a literal
+// (`name = 'a::b'`) are left alone — that text is data, not syntax.
+function stripCasts(s) {
+  let out = '', i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (c === "'") {
+      const start = i
+      i++
+      while (i < s.length) {
+        if (s[i] === "'") { if (s[i + 1] === "'") i++; else break }
+        i++
+      }
+      out += s.slice(start, i + 1)
+      i++
+      continue
+    }
+    if (c === ':' && s[i + 1] === ':') {
+      i += 2
+      while (i < s.length && /\s/.test(s[i])) i++
+      while (i < s.length && /\w/.test(s[i])) i++ // the type name, and ONLY it —
+      // a `/[\s\w]/` loop here would keep eating and swallow `and x` after the cast
+      if (s[i] === '(') { // a length/precision: `varchar(10)`, `numeric(10,2)`
+        let d = 0
+        while (i < s.length) { if (s[i] === '(') d++; else if (s[i] === ')') { d--; if (!d) { i++; break } } i++ }
+      }
+      continue
+    }
+    out += c
+    i++
+  }
+  return out
 }
 
 // Is this policy predicate a CONSTANT tautology — always true regardless of the
@@ -397,18 +476,41 @@ function isConstTautology(pred) {
 // `using (true and true)` and `using (null is null)` were all invisible: each
 // grants every row, and each shipped green.
 function constValue(pred) {
-  let s = String(pred).toLowerCase().replace(/\s+/g, ' ').trim()
+  let s = stripCasts(String(pred).toLowerCase()).replace(/\s+/g, ' ').trim()
   while (outerParenWrapsAll(s)) s = s.slice(1, -1).trim()
   if (s === 'true') return true
   if (s === 'false') return false
+  const OPERAND_RE = "'(?:[^']|'')*'|[\\w.]+"
+
+  // Shapes whose own body contains `and` / `or`, so they must be recognized
+  // BEFORE the split — otherwise `1 between 0 and 2` is torn into `1 between 0`
+  // and `2`, and reads as unknown. Each is anchored to the WHOLE predicate, so
+  // a larger expression that merely contains one still falls through to the
+  // split below.
+  const between = new RegExp(`^(${OPERAND_RE}) (not )?between (${OPERAND_RE}) and (${OPERAND_RE})$`).exec(s)
+  if (between) {
+    const [, a, neg, lo, hi] = between
+    const ge = constValue(`${a} >= ${lo}`)
+    const le = constValue(`${a} <= ${hi}`)
+    if (ge === null || le === null) return null
+    const v = ge && le
+    return neg ? !v : v
+  }
+  const kase = /^case when (.+?) then (.+?)(?: else (.+?))? end$/.exec(s)
+  if (kase) {
+    const cond = constValue(kase[1])
+    if (cond === null) return null
+    return cond ? constValue(kase[2]) : kase[3] === undefined ? null : constValue(kase[3])
+  }
+
   // OR before AND: `and` binds tighter, so the top level splits on `or` first.
-  const ors = splitTopOp(s, ' or ')
+  const ors = splitTopOp(s, 'or')
   if (ors.length > 1) {
     const vs = ors.map(constValue)
     if (vs.some((v) => v === true)) return true
     return vs.every((v) => v === false) ? false : null
   }
-  const ands = splitTopOp(s, ' and ')
+  const ands = splitTopOp(s, 'and')
   if (ands.length > 1) {
     const vs = ands.map(constValue)
     if (vs.some((v) => v === false)) return false
@@ -420,15 +522,48 @@ function constValue(pred) {
   }
   const OPERAND = "'[^']*'|[\\w.]+"
   const CONST = /^(?:-?\d+(?:\.\d+)?|'[^']*')$/
-  // `null is null` / `'a' is not null` — decidable only for a literal operand.
+  // A scalar subquery with no source (`(select true)`) is just its expression.
+  // Anything reading a table stays unknown — that is a real scope, not a constant.
+  const scalar = /^select (.+)$/.exec(s)
+  if (scalar && !/\b(from|where|join)\b/.test(scalar[1])) return constValue(scalar[1])
+  // `coalesce(true, x)` returns its first non-null argument.
+  const coal = /^coalesce\s*\((.+)\)$/.exec(s)
+  if (coal) {
+    for (const arg of splitArgs(coal[1])) {
+      if (arg === 'null') continue
+      return constValue(arg)
+    }
+    return null
+  }
+  // `X is [not] null | true | false | unknown` — decidable only when X itself is.
   // `deleted_at is null` is a real predicate and stays unknown.
-  const isnull = new RegExp(`^(${OPERAND})\\s+is\\s+(not\\s+)?null$`).exec(s)
-  if (isnull) {
-    const [, operand, negated] = isnull
+  const is = new RegExp(`^(.+?) is (not )?(null|true|false|unknown)$`).exec(s)
+  if (is) {
+    const [, operand, negated, want] = is
     const lit = operand.trim()
-    const isNull = lit === 'null' ? true : CONST.test(lit) ? false : null
-    if (isNull === null) return null
-    return negated ? !isNull : isNull
+    let v
+    if (want === 'null' || want === 'unknown') {
+      v = lit === 'null' ? true : CONST.test(lit) || lit === 'true' || lit === 'false' ? false : null
+    } else {
+      // `x is true` is false (not unknown) when x is null — that is the whole
+      // point of the IS form over `=`.
+      const inner = lit === 'null' ? 'null' : constValue(lit)
+      v = inner === null ? null : inner === 'null' ? false : inner === (want === 'true')
+    }
+    if (v === null) return null
+    return negated ? !v : v
+  }
+  // `1 is distinct from 2` — null-safe inequality, decidable between literals.
+  const distinct = new RegExp(`^(${OPERAND}) is (not )?distinct from (${OPERAND})$`).exec(s)
+  if (distinct) {
+    const [, a, neg, b] = distinct
+    const aNull = a === 'null', bNull = b === 'null'
+    let v
+    if (aNull || bNull) v = aNull !== bNull
+    else if (CONST.test(a) && CONST.test(b)) v = a !== b
+    else if (a === b) v = false // `col is distinct from col` is always false
+    else return null
+    return neg ? !v : v
   }
   const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
   if (refl && refl[1] === refl[2]) return true // owner_id = owner_id

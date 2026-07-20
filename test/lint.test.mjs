@@ -950,3 +950,76 @@ test('#dynamic unreadable dynamic DDL blocks by default', () => {
   assert.ok(f)
   assert.equal(f.severity, 'fail')
 })
+
+// ---------------------------------------------------------------------------
+// N3/N4 from the fix-verifier: the evaluator split boolean operators on
+// whitespace and knew only a handful of always-true spellings.
+// ---------------------------------------------------------------------------
+
+const usingPred = (pred) =>
+  scanSql(`create policy p on public.t for select to anon using (${pred});`, 'm.sql')
+    .findings.some((f) => f.rule === 'permissive_true')
+
+test('#tautology boolean operators are found by token, not by surrounding spaces', () => {
+  // Postgres accepts these and every one of them grants every row.
+  for (const pred of [
+    '(1=1)or(user_id=auth.uid())',
+    '(user_id=auth.uid())or(1=1)',
+    '(owner=owner)or(false)',
+    'true and(false or true)',
+  ]) {
+    assert.ok(usingPred(pred), `USING (${pred}) must be caught`)
+  }
+})
+
+test('#tautology a word merely containing "or"/"and" is not the operator', () => {
+  for (const pred of ['order_id = 1 and border_id = 2', 'nordic_id = 1', 'brand_id = tenant_id']) {
+    assert.ok(!usingPred(pred), `${pred} has no top-level operator to split on`)
+  }
+})
+
+test('#tautology IS TRUE, DISTINCT FROM, BETWEEN, COALESCE, CASE and casts reduce', () => {
+  for (const pred of [
+    'true is true',
+    'true is not false',
+    'not not true',
+    'coalesce(true,false)',
+    'coalesce(null,true)',
+    'case when true then true else false end',
+    'case when false then false else true end',
+    '1 between 0 and 2',
+    "'b' between 'a' and 'c'",
+    '1 is distinct from 2',
+    'true::boolean',
+    '1::int = 1::int',
+    '(select true)',
+  ]) {
+    assert.ok(usingPred(pred), `USING (${pred}) is always true and must be caught`)
+  }
+})
+
+test('#tautology the same shapes over COLUMNS stay unknown (no false alarms)', () => {
+  // Each of these is the row-dependent twin of a shape above. Reducing them
+  // would break a legitimate build, which is worse than the gap it closes.
+  for (const pred of [
+    'is_active is true',
+    'x is distinct from y',
+    'created_at between start_at and end_at',
+    'score between 1 and 10',
+    'coalesce(is_public, false)',
+    'case when is_admin then true else owner_id = auth.uid() end',
+    '(select count(*) from m where m.u = auth.uid()) > 0',
+    'not exists (select 1 from bans b where b.id = t.id)',
+    "name::text = 'a::b'",
+    "tenant = 'it''s or mine'",
+  ]) {
+    assert.ok(!usingPred(pred), `USING (${pred}) depends on the row`)
+  }
+})
+
+test('#tautology a cast does not swallow the rest of the expression', () => {
+  // `stripCasts` consuming [\s\w] would have eaten "and ..." after the type,
+  // silently turning a compound predicate into a bare constant.
+  assert.ok(!usingPred('flag::boolean and owner_id = auth.uid()'))
+  assert.ok(usingPred('true::boolean and true'))
+})

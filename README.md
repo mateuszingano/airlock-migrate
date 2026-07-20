@@ -20,7 +20,7 @@ npx airlock-migrate ./db/migrations
 |------|-------|---------|
 | `create_table_no_rls` | fail | a table created without `ENABLE ROW LEVEL SECURITY` |
 | `disable_rls` | fail | `ALTER TABLE ... DISABLE ROW LEVEL SECURITY`, including the `IF EXISTS` and descendant-`*` spellings |
-| `permissive_true` | fail | a policy predicate that reduces to always-true — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0`, and the boolean combinations `NOT false`, `true AND true`, `null IS null` — reachable by a client role. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
+| `permissive_true` | fail | a policy predicate that reduces to always-true, reachable by a client role — `USING (true)`, `(1=1)`, `(2>1)`, reflexive `(owner_id = owner_id)`, `(1 in (1))`, `length(x) >= 0`, the boolean forms `NOT false`, `true AND true`, `null IS null`, `true IS true`, `1 IS DISTINCT FROM 2`, `1 BETWEEN 0 AND 2`, `coalesce(true,false)`, `CASE WHEN true THEN true END`, `true::boolean`, `(select true)`. Operators are matched by token, so `(1=1)or(x)` counts even without spaces. Covers **both** `CREATE POLICY` and `ALTER POLICY`: widening an existing policy is what an adjustment migration actually does |
 | `dynamic_ddl_unanalyzed` | fail / warn | `EXECUTE` of SQL assembled at runtime (`format()`, `\|\|` concatenation, a variable) inside a `DO` block or function body. This gate reads SQL *text*, so it cannot resolve what such a statement targets — it says so instead of reporting the file as clean. **fail** when a fragment mentions row level security or a policy, **warn** for any other dynamic DDL |
 | `view_bypasses_rls` | warn | a `public` view/matview without `security_invoker = on` — runs as owner, bypasses the RLS beneath it |
 | `definer_no_search_path` | warn | a `SECURITY DEFINER` function with no pinned `SET search_path` (search-path hijack → runs as owner) |
@@ -91,13 +91,16 @@ Monitor watching production):
   they are not yours to police. That skip is now *reported* as a warning rather
   than silently omitted, so a project with its own schema of the same name can
   see that it was passed over.
-- **Always-true policy predicates the evaluator cannot reduce.** The tautology
-  check handles constants, reflexive equality, `NOT`, `AND`/`OR` and `IS NULL`,
-  but it splits boolean operators on whitespace — so `(1=1)or(x)`, written with
-  no spaces, is not reduced. Nor are `true IS true`, `coalesce(true,false)`,
-  `CASE WHEN true THEN true END`, `1 BETWEEN 0 AND 2`, `1 IS DISTINCT FROM 2`,
-  `true::boolean` or `(select true)`. These are real gaps, not judgement calls:
-  each one grants every row and passes clean today.
+- **Always-true predicates that need real type or catalog knowledge.** The
+  evaluator reduces constants, reflexive equality, `NOT`, `AND`/`OR` (found by
+  token, so `(1=1)or(x)` counts), `IS NULL/TRUE/FALSE`, `IS DISTINCT FROM`,
+  `BETWEEN`, `COALESCE`, a simple `CASE`, casts and a sourceless `(select …)`.
+  It stops where deciding would need to know types or resolve a function: an
+  always-true expression built from operators it does not model
+  (`'x' || '' = 'x'`, `array_length('{}'::int[],1) is null`), or a
+  user-defined function that always returns true (`using (my_always_true())`).
+  A predicate it cannot reduce is left alone rather than guessed at — the
+  evaluator is deliberately biased against false alarms on real policies.
 - **Dynamic DDL is reported, never resolved.** `dynamic_ddl_unanalyzed` tells you
   a statement was assembled at runtime and could not be read — it does not tell
   you what it did. Because a placeholder defeats any keyword test, the rule
