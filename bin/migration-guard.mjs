@@ -3,7 +3,8 @@
 //
 // Reads the migration .sql you are about to ship and fails (exit 1) when a
 // change would leak data or break auth: a table created without RLS, RLS
-// disabled, a permissive USING (true) policy, or a dropped policy/trigger.
+// disabled, or a permissive USING (true) policy. A dropped policy/trigger is
+// flagged as a warning (gate on it with --fail-on warn).
 // No database connection required.
 //
 // Usage:

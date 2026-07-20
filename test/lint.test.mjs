@@ -503,9 +503,27 @@ test('#doblock an executable body is analyzed however the statement is written',
   // a function body, LANGUAGE declared before or after AS
   assert.ok(rules(`create function f() returns void language plpgsql as $$\n${BODY}\n$$;`).includes('disable_rls'))
   assert.ok(rules('create function g() returns void as $$\n create table public.leaky3 (id int);\n$$ language sql;').includes('create_table_no_rls'))
+  // A comment or long whitespace between AS and $$ must NOT blank the body. This
+  // pushed `as` out of the 24-char tail window, the body was read as data, and a
+  // disable_rls inside it shipped green (exit 0) — a false negative in the core.
+  assert.ok(
+    rules(`create function h() returns void language plpgsql as  -- deploy hook\n$$\n${BODY}\n$$;`).includes('disable_rls'),
+    'a comment between AS and $$ must not silence the body',
+  )
+  assert.ok(
+    rules(`create function h2() returns void as\n\n\n\n\n\n\n\n\n\n$$\n${BODY}\n$$;`).includes('disable_rls'),
+    'long whitespace between AS and $$ must not silence the body either',
+  )
   // …and a dollar-quoted STRING is still treated as data (no false positive)
   assert.deepEqual(rules("select $doc$ create table public.ghost (id int); disable row level security $doc$;"), [])
   assert.deepEqual(rules('insert into t values ($$ create table public.ghost2 (id int); $$);'), [])
+  // A dollar-quoted DEFAULT inside the arg list is data, not the body — anchoring
+  // "is a function" to the head must not swallow it (it sits at paren-depth ≥1).
+  assert.deepEqual(
+    rules('create function j(x text default $q$alter table public.x disable row level security$q$) returns int language sql as $$ select 1 $$;'),
+    [],
+    'a dollar-quoted default value is data, not executable code',
+  )
 })
 
 // SYSTEM_SCHEMAS is a fixed list, so a project's own `auth`/`cron` schema — or a

@@ -2,8 +2,9 @@
 
 **The CI gate for dangerous Supabase/Postgres migrations.** It reads the `.sql`
 you are about to ship and fails the build when a change would leak data or break
-auth — a table created without RLS, RLS disabled, a `USING (true)` policy, or a
-dropped policy/trigger. **No database connection required.**
+auth — a table created without RLS, RLS disabled, or a `USING (true)` policy. It
+also flags a dropped policy/trigger as a warning (gate on it with
+`--fail-on warn`). **No database connection required.**
 
 Supabase leaves Row Level Security **off** for any table you create in SQL, a
 migration, or an ORM — the exact path AI-generated schemas take. Migration Guard

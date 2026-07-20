@@ -66,6 +66,11 @@ export function stripComments(sql, state) {
   // emitted `;`). Lets the dollar-quote classifier read the statement's opening
   // keyword in O(1) instead of scanning a lookback window.
   let stmtStartPart = 0
+  // Paren nesting at top level (outside string/comment/dollar). A function's
+  // BODY sits at depth 0, after the argument list closes; a dollar-quoted
+  // DEFAULT value sits inside the arg list at depth ≥1. Telling them apart is
+  // what stops `f(x default $q$…$q$)` from being read as executable code.
+  let parenDepth = 0
   while (i < n) {
     const c = sql[i]
     const c2 = sql[i + 1]
@@ -157,8 +162,20 @@ export function stripComments(sql, state) {
           // A DO block: the statement OPENS with `do`, whatever comes between it
           // and the body (`do $$`, `do language plpgsql $$`, `do language sql $$`).
           /^\s*do\b/i.test(stmtHead) ||
-          // A function body: `AS` always sits immediately before the dollar tag,
-          // whether LANGUAGE was declared before or after it.
+          // A CREATE FUNCTION / PROCEDURE body, anchored to the statement HEAD.
+          // The tail check below only sees the last 24 chars before `$$`, so a
+          // comment or long whitespace between `AS` and `$$` pushed `as` out of
+          // that window — the body was misread as a data string and blanked, and
+          // a `disable row level security` inside it vanished with the gate
+          // green. Deciding "is this a function definition?" from the opening
+          // keyword (O(1), like the `do` case) removes that cliff without
+          // widening the window into the O(n²) full-statement rescan the fixed
+          // window exists to avoid. `parenDepth === 0` keeps this to the BODY:
+          // a dollar-quoted default inside the arg list (depth ≥1) stays data.
+          (parenDepth === 0 &&
+            /^\s*create\s+(or\s+replace\s+)?(constraint\s+)?(function|procedure)\b/i.test(stmtHead)) ||
+          // A function body where AS sits within the tail window (the common
+          // short-header case, and any body form the head anchor above misses).
           /\bas\s*$/i.test(stmtTail)
         if (executable) { dollar = tag; openRange = [i]; parts.push(tag); i += tag.length; continue }
         // Blank the whole dollar-quoted string (preserve newlines for line numbers).
@@ -171,7 +188,9 @@ export function stripComments(sql, state) {
       }
     }
     parts.push(c)
-    if (c === ';') stmtStartPart = parts.length // a new statement begins after it
+    if (c === '(') parenDepth++
+    else if (c === ')') { if (parenDepth > 0) parenDepth-- }
+    else if (c === ';') { stmtStartPart = parts.length; parenDepth = 0 } // a new statement begins after it
     i++
   }
   // An executable body still open at EOF runs to the end of the text — treat it
