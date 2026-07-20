@@ -565,21 +565,35 @@ export function scanSql(sql, file) {
     // read it — no gap to report.
     if (/^'[^']*'$/.test(arg)) continue
     if (!arg) continue
-    // If any fragment mentions RLS or a policy, we KNOW this touches the thing
-    // the gate exists to protect and merely can't name the object: that breaks
-    // the build. Any other dynamic DDL is a warn — real, but not worth turning
-    // every `execute format('create index …')` into a red build.
-    const touchesRls = /row\s+level\s+security|\bpolicy\b/i.test(arg)
+    // Read the fragment with its seams removed: `format(`, the literal quotes
+    // and the `||` joins. Testing the raw text let one splice walk out —
+    // `'disable row' || ' level security'` never contains the phrase, so it was
+    // graded a warn and warns do not gate: RLS came down, exit 0.
+    const seamless = arg
+      .replace(/^format\s*\(/i, ' ')
+      .replace(/\|\||'/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    // Default is FAIL, and that is the point: this gate reads SQL text, so a
+    // statement assembled at runtime is text it cannot read. Grading the unknown
+    // as a warn meant the honest answer ("I could not check this") did not gate,
+    // which is the same disease as reporting an unreadable file clean. A
+    // placeholder alone defeats any keyword test — `format('… row level %s',
+    // 'security')` — so the burden runs the other way: stay loud unless the
+    // statement is visibly one of the operations that cannot touch RLS.
+    const HARMLESS = /^(create\s+(unique\s+)?index|drop\s+index|reindex|analyze|vacuum|refresh\s+materialized\s+view|comment\s+on)\b/i
+    const RLS_WORDS = /row\s+level\s+security|\bpolicy\b|\bgrant\b|\brevoke\b|\bowner\b/i
+    const harmless = HARMLESS.test(seamless) && !RLS_WORDS.test(seamless)
     const oneLine = arg.replace(/\s+/g, ' ').slice(0, 80)
     findings.push({
       rule: 'dynamic_ddl_unanalyzed',
-      severity: touchesRls ? 'fail' : 'warn',
+      severity: harmless ? 'warn' : 'fail',
       file,
       line: lineAt(m.index),
       object: file,
-      detail: touchesRls
-        ? `dynamic DDL built at runtime touches RLS/policies and could not be analyzed — the object it targets is not knowable from the text: \`${oneLine}\``
-        : `dynamic DDL built at runtime was not analyzed — if it touches tables or policies, this gate did not see it: \`${oneLine}\``,
+      detail: harmless
+        ? `dynamic DDL built at runtime was not analyzed — it reads as an index/maintenance statement, so it is reported rather than blocking: \`${oneLine}\``
+        : `dynamic DDL built at runtime could not be analyzed — the statement is assembled from fragments, so this gate cannot tell what it targets or whether it touches RLS: \`${oneLine}\``,
     })
   }
 

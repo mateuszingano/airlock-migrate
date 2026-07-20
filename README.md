@@ -52,12 +52,14 @@ An unprovable role is not a safe role, and staying quiet here would reopen the
 exact hole this rule exists to close. If the policy really is server-only, waive
 it with `--allow rule:permissive_true:<table>`.
 
-The same principle governs the allow-list itself: a token that would silence the
-whole gate is **refused**, not honoured. A bare `*` is rejected, and so is a bare
-schema name — since every Supabase table lives in `public`, `--allow public` was
-a kill switch wearing an ordinary word. Waive an object (`public.avatars`), a
-rule (`rule:drop_trigger`), or, if you really mean the whole schema, say it out
-loud with a prefix (`public.*`).
+**The allow-list tries not to hand you a kill switch by accident.** A bare `*` is
+refused. So is a bare schema name — every Supabase table lives in `public`, so
+`--allow public` was a kill switch wearing an ordinary word. And a prefix only
+reaches across the schema qualifier when the token itself contains a `.`, so
+`public*` and `p*` match table *names*, not every table in the schema. A
+schema-wide waiver is still available; you just have to say it out loud:
+`--allow public.*`. That is a deliberate off switch, and it is meant to read like
+one.
 
 ## What it does *not* cover yet
 
@@ -89,6 +91,20 @@ Monitor watching production):
   they are not yours to police. That skip is now *reported* as a warning rather
   than silently omitted, so a project with its own schema of the same name can
   see that it was passed over.
+- **Always-true policy predicates the evaluator cannot reduce.** The tautology
+  check handles constants, reflexive equality, `NOT`, `AND`/`OR` and `IS NULL`,
+  but it splits boolean operators on whitespace — so `(1=1)or(x)`, written with
+  no spaces, is not reduced. Nor are `true IS true`, `coalesce(true,false)`,
+  `CASE WHEN true THEN true END`, `1 BETWEEN 0 AND 2`, `1 IS DISTINCT FROM 2`,
+  `true::boolean` or `(select true)`. These are real gaps, not judgement calls:
+  each one grants every row and passes clean today.
+- **Dynamic DDL is reported, never resolved.** `dynamic_ddl_unanalyzed` tells you
+  a statement was assembled at runtime and could not be read — it does not tell
+  you what it did. Because a placeholder defeats any keyword test, the rule
+  blocks by default and only steps down to a warning for statements that read as
+  index/maintenance work. If your migrations build DDL dynamically on purpose,
+  expect to waive it deliberately with `--allow rule:dynamic_ddl_unanalyzed` —
+  and know that doing so waives *every* dynamic statement in the run.
 
 What it does **not** do silently: if a file ends *inside* an unterminated
 construct (string, block comment, dollar-quote), everything after the opener is

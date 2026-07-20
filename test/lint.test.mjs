@@ -886,3 +886,67 @@ test('#allow a schema name is refused — it would waive every table in it', asy
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// Regressions from the fix-verifier pass on the 20/07 fixes. Both of these were
+// holes opened BY the fixes above — the kill switch survived one extra
+// character, and the honest "I could not read this" was graded as non-blocking.
+// ---------------------------------------------------------------------------
+
+test('#allow a prefix cannot sweep a schema unless the schema is written out', async () => {
+  const dir = await fixtureDir()
+  try {
+    // Refusing the bare token `public` was not enough: these matched the head of
+    // every qualified object and turned the whole gate green.
+    for (const token of ['public*', 'pub*', 'p*']) {
+      const r = await lint({ dir, allow: [token] })
+      assert.ok(
+        r.findings.some((f) => f.rule === 'create_table_no_rls'),
+        `--allow ${token} must not waive a CRITICAL on public.secrets`,
+      )
+    }
+    // Said out loud, it still works — that is the documented escape hatch.
+    const explicit = await lint({ dir, allow: ['public.*'] })
+    assert.ok(!explicit.findings.some((f) => f.rule === 'create_table_no_rls'))
+    // And a prefix that names the schema keeps its reach.
+    const scoped = await lint({ dir, allow: ['public.sec*'] })
+    assert.ok(!scoped.findings.some((f) => f.rule === 'create_table_no_rls'))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('#allow an ordinary prefix still matches an unqualified object name', async () => {
+  const dir = await fixtureDir()
+  try {
+    const r = await lint({ dir, allow: ['sec*'] })
+    assert.ok(
+      !r.findings.some((f) => f.rule === 'create_table_no_rls'),
+      'avatars*-style prefixes must keep working',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('#dynamic splitting the phrase across fragments does not downgrade it', () => {
+  for (const stmt of [
+    "execute 'alter table ' || t || ' disable row'||' level security';",
+    "execute format('alter table %I disable row level %s', 'profiles', 'security');",
+    "execute format('alter table %I disable %s', t, v);",
+  ]) {
+    const { findings } = scanSql(`do $$ begin\n  ${stmt}\nend $$;`, 'm.sql')
+    const f = findings.find((x) => x.rule === 'dynamic_ddl_unanalyzed')
+    assert.ok(f, stmt)
+    assert.equal(f.severity, 'fail', `a warn does not gate, so this shipped exit 0: ${stmt}`)
+  }
+})
+
+test('#dynamic unreadable dynamic DDL blocks by default', () => {
+  // The burden runs this way round: a placeholder defeats any keyword test, so
+  // the gate stays loud unless the statement is visibly harmless.
+  const { findings } = scanSql("do $$ begin\n  execute format('%s', v);\nend $$;", 'm.sql')
+  const f = findings.find((x) => x.rule === 'dynamic_ddl_unanalyzed')
+  assert.ok(f)
+  assert.equal(f.severity, 'fail')
+})

@@ -157,9 +157,21 @@ export async function lint({ dir, files, allow = [] } = {}) {
     // `avatars*` is a PREFIX over identifier segments — so it covers
     // `avatars_secrets` but not `user_avatars_private`. Substring semantics here
     // would recreate the very bug this replaced, just behind an opt-in.
+    //
+    // A prefix reaches the QUALIFIED segment (`public.avatars`) only when the
+    // token itself carries a `.` — i.e. the schema was written on purpose.
+    // Refusing the bare token `public` was not enough: `public*`, and even `p*`,
+    // matched the head of every qualified object and turned the whole gate green
+    // again, CRITICALs included. The kill switch had survived behind one extra
+    // character. `public.*` and `public.av*` still work — they say the schema out
+    // loud, which was the whole point.
     if (token.endsWith('*')) {
       const prefix = token.slice(0, -1)
-      return [...segs].some((s) => s.startsWith(prefix))
+      const mayCrossSchema = prefix.includes('.')
+      return [...segs].some((s) => {
+        if (!mayCrossSchema && s.includes('.')) return false
+        return s.startsWith(prefix)
+      })
     }
     return segs.has(token)
   }
