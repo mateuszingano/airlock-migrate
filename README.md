@@ -144,8 +144,8 @@ $doc$`) is treated as data, while a `DO` block / function body stays analyzed
     # allow: avatars_public_read,rule:drop_trigger
 ```
 
-> `@v1` works once the first release tag is published. Until then, pin `@main`
-> or use the `npx` form below.
+> `@v1` tracks the latest v0.x release. Pin a specific tag (e.g. `@v0.2.0`) to
+> lock the version, or use the `npx` form below.
 
 Or run the CLI directly:
 
